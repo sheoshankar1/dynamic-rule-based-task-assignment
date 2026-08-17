@@ -1410,15 +1410,25 @@ test suite needs no Redis. The hazard this creates is stated in [§7.7](#77-the-
 
 ## API surface
 
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/auth/signup`, `/auth/login`, `/auth/refresh` | JWT + refresh |
-| GET, POST | `/tasks/` | List (filtered, paginated, role-scoped); create with rules |
-| GET, PATCH, DELETE | `/tasks/{id}` | Detail; edit fields, status or rules; delete |
-| POST | `/tasks/{id}/complete` | Terminal transition; `?cancelled=1` |
-| GET | `/tasks/{id}/eligible-users` | Stored set ∩ live capacity filter, in selection order |
-| GET | `/my-eligible-tasks` | Tasks assigned to the caller |
-| POST | `/tasks/recompute-eligibility` | Queues materialisation, returns 202 + job ids |
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| POST | `/auth/signup` | anyone | Always creates a `user`; the role is not accepted from the body |
+| POST | `/auth/login`, `/auth/refresh` | anyone | JWT pair; the access token carries `role` and `username` |
+| POST | `/auth/logout` | authenticated | Blacklists the refresh token |
+| POST | `/tasks/` | Manager, Admin | Create with rules. Queues exactly one job |
+| GET | `/tasks/` | all | List — filtered, paginated. A User sees only their own |
+| GET | `/tasks/{id}` | all | Detail. A User may read only their own task |
+| PATCH | `/tasks/{id}` | Manager, Admin; assignee for `status` | Edit fields, status or rules |
+| DELETE | `/tasks/{id}` | Manager, Admin | Releases the assignee's capacity first |
+| POST | `/tasks/{id}/complete` | assignee, Manager, Admin | Terminal transition; `?cancelled=1` |
+| GET | `/tasks/{id}/eligible-users` | **Manager, Admin** | Stored set ∩ live capacity filter, in selection order. Restricted because it exposes colleagues' workload |
+| GET | `/my-eligible-tasks` | all | Tasks assigned to the caller |
+| POST | `/tasks/recompute-eligibility` | **Admin** | Queues materialisation, returns 202 + job ids |
+| GET | `/schema`, `/docs` | anyone | OpenAPI and Swagger UI |
+
+Every restriction above is enforced server-side and covered by a test. The UI additionally
+hides what the caller cannot use ([Frontend](#frontend)), but that is presentation — a forged
+role claim buys a visible button and a 403.
 
 **`/my-eligible-tasks` interpretation.** "Eligible **and** assigned" is read as the conjunction: a
 user sees a task once it is assigned to them. Assignment already implies eligibility, so the query
@@ -1699,6 +1709,9 @@ would need a realistic distribution.
 | Effort edits moving committed hours | A counter desync that skews selection with no error |
 | Read authorisation | A recipient enumerating colleagues' workload, or reading the board |
 | The uncapped-rule drain | One transaction absorbing an entire pool when a rule sets no cap |
+| Recipient role | A Manager being auto-assigned the task they just authored |
+| Token revocation | A refresh token still working after sign-out |
+| Create-path cost | A second broker round trip creeping back into the request path |
 
 ```bash
 python manage.py test assignment
