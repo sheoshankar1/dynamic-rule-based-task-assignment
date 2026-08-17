@@ -1,0 +1,10 @@
+# Without this, `COPY . .` ships 95 MB of macOS-compiled virtualenv and 42 MB of
+# node_modules into a Linux image -- slow to build, and the venv's binaries are
+# wrong for the target platform.
+.venv/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.git/
+.env
