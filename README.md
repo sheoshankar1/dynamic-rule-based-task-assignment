@@ -17,9 +17,15 @@ Built and measured at the stated scale: **100,000 users, 1,000,000 tasks.**
 
 ## Running it
 
+**Prerequisites:** Docker with Compose v2. Nothing else — Python, PostgreSQL, Redis and Node all
+run inside containers.
+
 ```bash
 docker compose up --build
 ```
+
+First build takes 2–3 minutes. The stack is ready when `web` reports healthy; it migrates and
+seeds automatically before serving.
 
 | | |
 |---|---|
@@ -40,7 +46,81 @@ POSTGRES_HOST=/tmp POSTGRES_PORT=5432 .venv/bin/python manage.py migrate
 ```
 
 Celery runs jobs inline unless `CELERY_EAGER=0`, so the test suite and a bare `runserver`
-exercise the whole assignment path without a broker.
+exercise the whole assignment path without a broker. To exercise the real asynchronous path
+outside Docker you also need Redis running, and a worker:
+
+```bash
+CELERY_EAGER=0 .venv/bin/celery -A config worker -B -l info
+```
+
+### What a successful start looks like
+
+```
+db        Up (healthy)      redis  Up (healthy)      web  Up (healthy)
+worker    Up                frontend  Up
+
+web-1  | seeded
+web-1  |   users            202
+web-1  |   distinct rules R 8 (requested 8; fewer means dedup fired)
+web-1  |   T/R dedup ratio  6.2:1
+web-1  |   assigned         50/50
+web-1  |   login            manager/manager, admin/admin, any userNNNN/demo
+```
+
+`assigned 50/50` means the assignment engine placed every seeded task. `dedup ratio` is the
+deduplication in [§1.3](#13-decision-eligibility-is-stored-per-rule-not-per-task) working.
+
+### Verifying it works, in about a minute
+
+1. Open http://localhost:5173 and sign in as `manager` / `manager`.
+2. **Create task** — pick a department, set a minimum experience, and watch the *Rule as sent*
+   panel build the rule. Submit.
+3. The result line reads `placement queued, waiting for the worker…` and then resolves to
+   `assigned to userNNNN`. That transition is the background path in
+   [Part 7](#part-7--background-processing-design): the response returns before the assignment
+   exists.
+4. Create the **same rule again**. The response reports `rule_reused: true` — no recomputation,
+   which is [§1.5](#15-decision-rules-are-immutable).
+5. Sign in as the assigned `userNNNN` / `demo` and open **My tasks** to see it.
+
+Or without the UI:
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/auth/login   -H 'Content-Type: application/json'   -d '{"username":"manager","password":"manager"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access"])')
+
+curl -s -X POST localhost:8000/tasks/ -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json'   -d '{"title":"Check","priority":0,"effort_hours":"2.0",
+       "rules":{"department":"Finance","experience_years":{"gte":4},"max_active_tasks":5}}'
+```
+
+Every endpoint is also callable interactively from Swagger at http://localhost:8000/docs.
+
+### Running the tests
+
+```bash
+docker compose exec web python manage.py test assignment
+```
+
+56 tests, about 10 seconds in the container. They need no broker.
+
+### Reproducing the performance figures
+
+```bash
+docker compose exec web python manage.py seed_scale --users 100000 --tasks 1000000 --rules 1000
+docker compose exec web python manage.py benchmark --iterations 400 --workers 8
+```
+
+The seed takes about 5 minutes and replaces the demo data. The benchmark prints the table in
+[§6.2](#62-measured) and asserts there is no sequential scan on any request-path query.
+
+### If something does not start
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `port is already allocated` | 5432, 8000 or 5173 in use locally — Redis is not published to the host | Stop the local service, or change the host port in `docker-compose.yml` |
+| `web` restarts repeatedly | Usually a migration or connection error | `docker compose logs web` |
+| UI loads, API calls fail | `web` not healthy yet | Wait for the healthcheck; `docker compose ps` |
+| Tasks stay `pending` forever | Worker not running | `docker compose logs worker` — it should show `place_task ... succeeded` |
+| Want a clean slate | Seeded data persists in a volume | `docker compose down -v` then `up` again |
 
 ---
 
@@ -718,13 +798,126 @@ add invalidation surface without reducing work.
 
 # Part 6 — Performance optimisation
 
-**Requirement.** 100k users, 1M tasks, APIs under 200 ms using caching, indexing, background
+**Requirement.** 100k users, 1M tasks, APIs under 200 ms using caching, indexing and background
 processing.
 
-## 6.1 Measured
+## 6.1 The optimisations, and what each one addresses
 
-PostgreSQL 14 at exactly that scale — 100,000 users, 1,000,000 tasks, **15,384,332 eligibility
-rows (2,380 MB)**. 8 concurrent workers, 400 iterations after warmup.
+Ordered by how much they matter. Each states the cost it removes, not just that it exists.
+
+### 1. Eligibility is stored per rule, not per task
+
+| | |
+|---|---|
+| **Removes** | Storing and maintaining `tasks × eligible users` rows |
+| **Effect** | 5,000,000,000 rows → 15,384,332 measured. A `tasks / rules` reduction, **1000:1** on seeded data |
+| **Cost** | Rules must be canonicalised and hashed on every write — microseconds |
+
+This is the only optimisation that changes the complexity class. Everything else is constant
+factors on top of it. Detail in [§1.3](#13-decision-eligibility-is-stored-per-rule-not-per-task).
+
+### 2. Volatile predicates are never materialised
+
+| | |
+|---|---|
+| **Removes** | Recomputation triggered by capacity changes |
+| **Effect** | The field that changes on **every assignment** produces zero background work |
+| **Cost** | Capacity is filtered at query time instead of being pre-joined |
+
+Without it, one assignment invalidates every stored set containing that user. At this scale the
+system would not converge. Detail in [§1.4](#14-decision-predicates-are-split-by-volatility).
+
+### 3. The selection index is built in selection order
+
+| | |
+|---|---|
+| **Removes** | Collecting every eligible user and sorting them to pick one |
+| **Effect** | 31.9 ms → 12.4 ms on the widest rule; the plan changes from sort-then-limit to walk-and-stop |
+| **Cost** | Index bloat under a volatile leading column — see [§4.3](#43-operational-requirement) |
+
+```
+Limit
+  -> Nested Loop
+       -> Index Scan using users_selection_order      ← walks in selection order
+       -> Index Only Scan using uniq_rule_user        ← "is this user eligible?"
+            Heap Fetches: 0
+```
+
+`Heap Fetches: 0` means the eligibility check is answered from the index alone, without reading
+the table.
+
+### 4. `LIMIT 1`, not a candidate list
+
+| | |
+|---|---|
+| **Removes** | Fetching and holding N candidates when only one is needed |
+| **Effect** | No measurable latency change — but a held list goes stale as other workers claim slots |
+| **Cost** | A lost race means re-querying rather than trying the next cached row |
+
+The four-key order is total, so exactly one row is the answer. Re-querying after a lost race is
+also *more correct* than a cached list: it reflects the state that now exists.
+
+### 5. Partial indexes on open work
+
+| | |
+|---|---|
+| **Removes** | Index entries for completed tasks, which are never queried |
+| **Effect** | Index size tracks *open* work, not lifetime task volume |
+| **Cost** | The predicate must match the query exactly or the index is not used |
+
+Over a million tasks with most completed, this is the difference between an index that stays in
+memory and one that does not.
+
+### 6. Denormalised capacity counters
+
+| | |
+|---|---|
+| **Removes** | `COUNT(*)` and `SUM()` on every selection query |
+| **Effect** | Capacity becomes a column comparison inside an index scan |
+| **Cost** | The counters can drift, so they are written only inside the assignment and completion transactions |
+
+This is also what makes the compare-and-set possible: the check must reference a column, not an
+aggregate. Correctness depends on it, not only speed.
+
+### 7. Redundant indexes removed
+
+| | |
+|---|---|
+| **Removes** | Django's automatic single-column index per foreign key |
+| **Effect** | **233 MB** saved at 15.4M rows |
+| **Cost** | None — both were fully covered by composite indexes already present |
+
+### 8. Immutable rule specs are cached
+
+| | |
+|---|---|
+| **Removes** | A rule row fetch on every assignment |
+| **Effect** | Small; assignment was not database-bound |
+| **Cost** | None — rule rows never change, so the cache needs no invalidation |
+
+Only the immutable half is cached. `eligible_count` changes on every materialisation, and caching
+it would misreport *why* a task is unassigned.
+
+### 9. Single-flight on materialisation
+
+| | |
+|---|---|
+| **Removes** | N workers performing the same scan after one invalidation |
+| **Effect** | Duplicate work, not latency |
+| **Cost** | A TTL is required so a worker dying mid-scan cannot wedge a rule permanently |
+
+### 10. Debounced recompute
+
+| | |
+|---|---|
+| **Removes** | One recompute job per edit during a burst |
+| **Effect** | A burst of edits to one user collapses to one job |
+| **Cost** | Eligibility lags by the debounce window |
+
+## 6.2 Measured
+
+PostgreSQL 14 at the stated scale — 100,000 users, 1,000,000 tasks, **15,384,332 eligibility rows
+(2,380 MB)**. 8 concurrent workers, 400 iterations after a 20-iteration warmup.
 
 | Query | p50 | p95 | Achieved rate |
 |---|---|---|---|
@@ -735,16 +928,27 @@ rows (2,380 MB)**. 8 concurrent workers, 400 iterations after warmup.
 
 **Approximately 120× margin** on the 200 ms target.
 
-`manage.py benchmark` **asserts** there is no sequential scan on any request-path query rather
-than reporting it, because a plan regression is invisible until the table grows.
+### Method
 
-The achieved rate is printed beside every latency, because "under 200 ms" means nothing without a
-load figure.
+```bash
+python manage.py seed_scale --users 100000 --tasks 1000000 --rules 1000
+python manage.py benchmark --iterations 400 --workers 8
+```
 
-**These are SQL-layer measurements.** They exclude HTTP, serialisation and network, so end-to-end
-latency is higher. Stated in the benchmark's own docstring.
+- The achieved rate is printed beside every latency, because "under 200 ms" means nothing without
+  a load figure. The brief supplies none, so the measurement publishes the load it used rather
+  than asserting one.
+- The benchmark **asserts** there is no sequential scan on any request-path query rather than
+  reporting it, because a plan regression is invisible until the table grows.
+- Warmup runs are discarded so the figures describe steady state rather than cold cache.
 
-## 6.2 The row-count model was checked, not trusted
+### What the numbers exclude
+
+These are **SQL-layer** measurements. They exclude HTTP handling, JSON serialisation and network,
+so end-to-end latency is higher. Stated in the benchmark's own docstring so the figure cannot be
+quoted as end-to-end by accident.
+
+## 6.3 The cost model was checked, not trusted
 
 ```
 predicted:  rules × selectivity × users
@@ -752,19 +956,26 @@ predicted:  rules × selectivity × users
 actual:                                  15,384,332
 ```
 
-## 6.3 Rule count constrains storage, not latency
+The formula used for capacity planning is exact, not an approximation.
 
-Selection latency was measured across rule counts from 10² to 5×10³ at fixed user count. p95
-stayed flat on every request-path query. The binding constraint on rule cardinality is disk and
-vacuum, not query time.
+## 6.4 Where it degrades
 
-## 6.4 The three mechanisms the brief names
+| Pressure | Effect | Mitigation |
+|---|---|---|
+| Rule count grows | Storage grows linearly; **latency does not** — measured flat from 10² to 5×10³ rules | The binding constraint is disk and vacuum, not query time |
+| Assignment volume | `users_selection_order` bloats: 216 kB → 23 MB over 400k updates, and `VACUUM` reclaims none of it | Scheduled `REINDEX CONCURRENTLY` ([§4.3](#43-operational-requirement)) |
+| A rule matching nearly everyone | The index walk travels further before finding an eligible user | Bounded by the capacity filter; no rule in the seeded set exceeded this |
 
-| Mechanism | Where |
+## 6.5 Optimisations rejected after measurement
+
+Listed because a rejected optimisation is evidence the measurement was actually taken.
+
+| Considered | Outcome |
 |---|---|
-| Indexing | [Part 4.2](#42-indexing-strategy) |
-| Caching | [Part 5](#part-5--caching-strategy) |
-| Background processing | [Part 7](#part-7--background-processing-design) |
+| Cache the eligible set per rule in Redis | **Rejected.** The query it would replace runs at p95 1.65 ms, and the capacity filter must reach the database regardless — the cache adds invalidation surface without removing work |
+| Application-level query plan switch, chosen by rule size | **Rejected.** The planner selects the intended index walk unaided at every rule size tested |
+| `random_page_cost = 1.1` as a significant win | **Downgraded.** Worth ~2× on an early synthetic schema; on the real one it moved p95 by 0.02 ms. Retained because 4.0 models the wrong storage, but it is not load-bearing |
+| Reduce the selection order to one key | **Rejected.** Saves 7 ms on a 32 ms query whose cost is the join plan, and forfeits the fairness and determinism the other three keys provide |
 
 ---
 
@@ -772,12 +983,12 @@ vacuum, not query time.
 
 **Requirement.** The system computes eligible users in the background.
 
-## 7.1 Why it is background work
+## 7.1 Why any of this is background work
 
 A **queue** (Redis) is a list of jobs. A **worker** (Celery) is a separate process that pulls jobs
-and runs them. The web server queues work and responds immediately.
+and runs them. The web process queues work and responds immediately.
 
-Assignment scans a rule's eligible users and must survive competing claims. Performing that inside
+Assignment scans a rule's eligible users and must survive competing claims. Performing it inside
 the HTTP request means the client holds a connection while it runs, and a broad rule blocks the
 response. Queueing makes task creation cost the same regardless of how many users a rule matches.
 
@@ -809,10 +1020,30 @@ sequenceDiagram
     Note over K,D: ~0.6 s after the response
 ```
 
-**Consequence.** The create response cannot report the assignee, because it does not exist yet —
-which is why `pending` is a reported state (§1.9).
+**Consequence, accepted deliberately.** The create response cannot report the assignee, because it
+does not exist yet. It reports `pending`, and the client polls
+[`GET /tasks/{id}`](#api-surface). Reporting a guess instead would be wrong roughly as often as
+the worker is busy.
 
-## 7.2 One primitive, five triggers
+## 7.2 Job inventory
+
+Six jobs. Each is a thin wrapper over a service function, so all of them are callable and testable
+without a broker.
+
+| Job | Triggered by | Does | Idempotent? |
+|---|---|---|---|
+| `materialize_rule` | New rule; recompute endpoint | Computes a rule's eligible users, then drains that rule's pooled tasks | Yes — guarded by a single-flight lock |
+| `place_task` | Task created; pool drain | Finds the best candidate and claims capacity | Yes — a task already assigned is skipped |
+| `fill_capacity` | Completion; eligibility gain; user created | Fills one user's free capacity from the pool, in priority order | Yes — stops when nothing fits |
+| `recompute_user` | Stable attribute change | Diffs a user's rule membership and writes the delta | Yes — computes from current state |
+| `sweep_unassigned_pool` | Beat, every 5 minutes | Re-places pooled tasks | Yes |
+| `flag_stuck_tasks` | Beat, hourly | Reports tasks unassignable beyond a threshold | Yes |
+
+**Every job is idempotent by construction, not by bookkeeping.** Each reads current state and acts
+on it, so running one twice produces the same result as running it once. That is what makes
+at-least-once delivery safe — no job needs a dedupe table.
+
+## 7.3 One primitive, five triggers
 
 ```
 fill_capacity(user):
@@ -829,55 +1060,223 @@ fill_capacity(user):
 | Task created | Its rule's best candidate is asked to fill |
 | Rule finished materialising | Its eligible set went from empty to populated |
 
-The last trigger is not optional. Materialisation and placement are independent jobs with no
-ordering between them, so for a brand-new rule placement routinely runs against an empty
-eligibility table.
+Assignment happens in exactly one place. Detail and the failure it prevents in
+[§1.6](#16-decision-one-assignment-path).
 
-## 7.3 Periodic jobs
+## 7.4 Ordering between jobs
 
-Celery beat runs in the worker process — these are low-frequency safety nets, not throughput work,
-so a separate container would add operational surface for nothing.
+**Celery guarantees nothing about the order two queued jobs run in.** Two consequences were
+designed for rather than assumed away.
 
-| Job | Purpose | Why |
+**Materialisation before placement.** Creating a task queues `materialize_rule` and `place_task`
+independently. For a brand-new rule, placement routinely runs first, finds an empty eligibility
+table, and pools the task. Rather than chaining the jobs — which would couple them and still fail
+if the chain were lost — **materialisation completing is itself a trigger** (§7.3). Whichever runs
+first, the task is placed.
+
+**The enqueue is deferred to commit.** Jobs are queued with `transaction.on_commit`, not inline.
+A worker is a separate process with its own connection, so a job queued mid-transaction can be
+picked up and read the database *before* the transaction commits — finding a task that does not
+exist yet. Deferring to commit removes that window.
+
+## 7.5 Failure handling
+
+| Failure | Detection | Recovery |
 |---|---|---|
-| Pool sweep | Re-place pooled tasks | Queue messages can be lost. It **logs a warning when it places anything**, because regular activity means the event path is broken |
-| Stuck-task check | Report tasks unassignable beyond a threshold | A task no one can see is indistinguishable from one that was never created |
+| Queue message lost | The task stays pooled | `sweep_unassigned_pool` re-places it. It **logs a warning when it places anything**, because regular activity means the event path is broken and the sweep is masking a bug |
+| Worker dies mid-materialisation | The single-flight lock would block future attempts | The lock carries a TTL, so it expires rather than wedging the rule permanently |
+| Worker dies mid-assignment | The claim is transactional | Either the counter and the assignee are both written, or neither is |
+| Rule matches nobody, indefinitely | Nothing fails; the task simply sits | `flag_stuck_tasks` logs a warning past a threshold. A task no one can see is indistinguishable from one that was never created |
+| Counters drift from reality | Not self-detecting | They are written only inside the assignment and completion transactions, and can be rebuilt by aggregating the tasks table |
+
+**The safety nets are not the mechanism.** Both periodic jobs exist to cover infrastructure
+failure, not logic gaps. That is why the sweep logs when it succeeds: if it is regularly finding
+work, the event path in §7.3 has a hole.
+
+## 7.6 Worker topology
+
+```
+web        Django, request path only. Queues jobs, never assigns.
+worker     Celery worker with beat in the same process (-B).
+redis      Broker, plus the cache and the locks.
+```
+
+**Why beat runs inside the worker.** The two periodic jobs run every five minutes and hourly.
+A separate scheduler container would add a process to deploy, monitor and restart, for work that
+is measured in milliseconds per hour.
+
+**Why the assignment rate does not need many workers.** Tasks are authored by people, so
+assignment volume is bounded by human activity — single-digit writes per second even at 100,000
+users, against a measured 0.68 ms selection query.
+
+## 7.7 The test-mode hazard, stated explicitly
+
+`CELERY_TASK_ALWAYS_EAGER=1` runs jobs inline, so the test suite and a bare `runserver` exercise
+the whole path without Redis. This is convenient and it **hides concurrency**: inline jobs run to
+completion in order, which is exactly what production does not do.
+
+Two defects reached the running system through that gap — a response that reported a definitive
+outcome before placement had run, and the materialisation ordering in §7.4. Both now have
+regression tests that force the adversarial ordering explicitly rather than relying on timing.
+
+## 7.8 What is deliberately not background
+
+| Kept synchronous | Why |
+|---|---|
+| Task creation, validation, rule hashing | Must be able to reject bad input in the response |
+| All reads (`/tasks/`, `/my-eligible-tasks`, detail) | Bounded index lookups; queueing would add latency and complexity for nothing |
+| The capacity claim itself | It is a single atomic statement — moving it would add a hop without removing work |
 
 ---
 
 # Part 8 — Code structure
 
+## 8.1 Layout
+
 ```
 assignment/
-  models.py      schema; stable and volatile fields marked in the model itself
-  rules.py       the rule engine: canonicalise, hash, to_sql, matches
-  services.py    all business logic; testable without a broker
-  signals.py     stable-attribute change detection and debounce
-  tasks.py       Celery entry points - thin wrappers over services
-  views.py       validate, delegate, serialise
-  tests.py       56 tests
+  models.py       179   schema; stable and volatile fields marked in the model
+  rules.py        159   rule engine: canonicalise, hash, to_sql, matches
+  services.py     492   all business logic
+  signals.py       79   stable-attribute change detection and debounce
+  tasks.py         37   Celery entry points
+  views.py        588   validate, delegate, serialise
+  urls.py          25
+  tests.py        815   56 tests
   management/commands/
-    seed.py         demo data, drives the real service layer
-    seed_scale.py   benchmark data, parameterised on rule count and selectivity
-    benchmark.py    query plans and latencies, asserts no sequential scans
-config/          settings, Celery app, URLs
-frontend/        React 18 + Vite
+    seed.py            demo data, drives the real service layer
+    seed_scale.py      benchmark data, parameterised on rule count and selectivity
+    benchmark.py       query plans and latencies; asserts no sequential scans
+config/           settings, Celery app, URL roots
+frontend/         React 18 + Vite
 ```
 
-**Principles applied:**
+`tests.py` is the largest module in the app after `views.py`. That is deliberate: the logic that
+is hard to see when wrong is the logic that carries the most tests.
 
-- **Logic lives in `services.py`, not views.** Every service function is callable from a test, a
-  management command, or a Celery job without HTTP.
-- **Celery tasks are thin.** They wrap service functions so the logic is testable without a
-  broker.
-- **Raw SQL only where it must be exact** — the selection order and the compare-and-set. The ORM
-  cannot express a compare-and-set, and the selection query depends on a specific plan.
-- **One source of truth per rule.** Status transitions live in `OPEN_TRANSITIONS` and nowhere
-  else; restricting the serializer's choices as well would duplicate the rule and replace an
-  explanation with a generic validation error.
-- **Errors explain themselves.** Refusing a transition returns *"cannot move todo → done. Use
-  /tasks/3/complete for done or cancelled, so the capacity counters are updated in the same
-  transaction"* rather than a bare rejection.
+## 8.2 Dependency direction
+
+```
+views  ──┐
+tasks  ──┼──►  services  ──►  rules   ──►  (nothing)
+signals ─┘         │
+                   └──────►  models  ──►  (nothing)
+```
+
+Verified by inspection of the imports: `rules.py` and `models.py` import nothing from the app.
+`services.py` imports only `models` and `rules`. `views.py` and `tasks.py` both import `services`.
+Nothing imports `views`.
+
+**Why the direction matters.** The rule engine has no knowledge of Django views, Celery, or HTTP,
+so it can be tested as a pure function. The service layer has no knowledge of requests, so the
+same function serves an HTTP call, a Celery job, a management command and a test.
+
+## 8.3 The service layer is the seam
+
+Every operation that changes state lives in `services.py` and takes plain arguments:
+
+```python
+get_or_create_rule(raw_rule)     materialize_rule(rule_id)
+recompute_user(user_id)          fill_capacity(user_id)
+place_task(task_id)              complete_task(task_id, cancelled=False)
+set_status(task_id, status)      delete_task(task_id)
+repoint_rule(task_id, raw_rule)  sweep_unassigned_pool()
+```
+
+**Why not put this in views or model methods.**
+
+- *In views:* it would be reachable only over HTTP. The Celery jobs, three management commands and
+  most of the test suite call these functions directly.
+- *On models:* assignment spans `users`, `tasks`, `rules` and `rule_eligible_user`. Placing it on
+  any one model makes that model the de facto owner of the other three.
+
+**Celery tasks are six one-line wrappers.** `tasks.py` is 37 lines. Nothing can be reachable only
+through a broker.
+
+## 8.4 Where raw SQL is used, and why
+
+Three statements are raw. Everything else uses the ORM.
+
+| Statement | Why not the ORM |
+|---|---|
+| `_TOP_CANDIDATE` | The query must produce a specific plan — an index walk in selection order, stopping at the first match. The ORM offers no way to state that intent |
+| `_CLAIM` | A compare-and-set is `UPDATE ... WHERE <condition> RETURNING`. The ORM has no expression for "update only if this predicate still holds, and tell me whether it did" |
+| `_NEXT_POOLED_TASK` | A three-table join with a compound order, on the hottest path in the system |
+
+All three are module-level constants with the reasoning in comments beside them, and all are
+parameterised — none interpolates user input.
+
+## 8.5 Trust boundaries
+
+Rules arrive from an API, so `rules.py` treats its input as hostile:
+
+- Unknown predicate keys are rejected, not ignored
+- Type errors raise `InvalidRule` with a message naming the field, not a `KeyError`
+- Multi-valued predicates are **rejected rather than truncated** — silently dropping a department
+  would route work to the wrong team with no error to observe
+- Generated SQL is always parameterised
+
+## 8.6 One source of truth per rule
+
+Two examples where the same rule could easily have been written twice:
+
+**Status transitions** live in `OPEN_TRANSITIONS` in `services.py`. The serializer accepts every
+status value on purpose — restricting its choices as well would duplicate the rule, and would
+replace an explanation with `'"done" is not a valid choice.'` The actual response is:
+
+```
+cannot move todo -> done. Allowed from here: [in_progress].
+Use /tasks/3/complete for done or cancelled, so the capacity
+counters are updated in the same transaction.
+```
+
+**Stable field names** live in `User.STABLE_FIELDS`. The signal, the change detector and the
+snapshot all read that tuple, so adding a stable attribute is a one-line change.
+
+## 8.7 Transaction boundaries
+
+Six atomic blocks, each wrapping one invariant:
+
+| Operation | What must not be partially applied |
+|---|---|
+| `fill_capacity` | The capacity claim and the assignee write |
+| `complete_task` | Status, both counters, and the effort moving between them |
+| `delete_task` | Releasing capacity and removing the row |
+| `set_status` | Read-modify-write under `select_for_update` |
+| `repoint_rule` | The rule pointer and any release of an ineligible assignee |
+| `materialize_rule` | Clearing and repopulating one rule's eligible set |
+
+## 8.8 Testing strategy
+
+56 tests, chosen by a single criterion: **does a defect here fail loudly at runtime?** If yes, it
+is not tested. If no, it is.
+
+| Tested | Why |
+|---|---|
+| `to_sql` ≡ `matches`, exhaustively | Two implementations of one semantics; divergence is silent |
+| The priority-overtake race | Reproduced against the two-path design first, then proven fixed |
+| 16-thread capacity race, barrier-synchronised | The test fails if no thread loses, since that would mean it never contended |
+| Drain ordering with scrambled input | Wrong key order still produces plausible output |
+| Recompute deltas | An eligibility gap is invisible until a task fails to be assigned |
+| Counter release on delete | Leaked capacity skews selection permanently, with no error |
+| Cache and lock failure modes | A wedged lock makes a rule permanently unmaterialisable |
+| Status transition refusal | The refusal must explain itself, not just refuse |
+
+**Not tested:** CRUD serialisers, URL routing, Django's own behaviour. Those fail on the first
+request with a stack trace.
+
+## 8.9 Configuration
+
+Everything environment-dependent reads from the environment with a working local default, so the
+same image runs under Compose and against a local PostgreSQL:
+
+```python
+POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+REDIS_URL, CELERY_EAGER, DJANGO_SECRET_KEY, DJANGO_DEBUG
+```
+
+`CELERY_EAGER` also selects the cache backend — local memory when eager, Redis otherwise — so the
+test suite needs no Redis. The hazard this creates is stated in [§7.7](#77-the-test-mode-hazard-stated-explicitly).
 
 ---
 
