@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { isAuthed, clearTokens, currentUser } from "./api.js";
 import Login from "./views/Login.jsx";
 import CreateTask from "./views/CreateTask.jsx";
@@ -16,6 +16,13 @@ export default function App() {
   // form the API would reject after they had filled it in.
   const tabs = ALL_TABS.filter(([, , , roles]) => !roles || roles.includes(user?.role));
   const [tab, setTab] = useState(tabs[0][0]);
+
+  // The tab list depends on the role, which is unknown on the first render --
+  // so the initial state above is computed while logged out and would strand a
+  // Manager on the wrong tab after signing in. Re-seat it whenever auth changes.
+  useEffect(() => {
+    setTab(tabs[0][0]);
+  }, [authed]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
 

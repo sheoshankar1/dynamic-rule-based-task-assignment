@@ -1386,6 +1386,11 @@ server-side, so a forged claim buys a visible button and a 403.
 ([§2.1](#21-rule-shape)), so the shape of the form *is* the shape of a rule. A free-text field
 would imply expressiveness the engine does not have.
 
+**Clearing the department is allowed, and warned about.** Clicking the selected department
+deselects it, which is easy to do by accident and produces a rule with no department — one that
+matches every user. "Anyone may do this" is a legitimate rule, so the form permits it and states
+the consequence instead of forbidding it.
+
 **Why it polls.** Assignment happens in a worker, so the create response cannot know the outcome
 ([§7.1](#71-why-any-of-this-is-background-work)). The UI polls `GET /tasks/{id}` until the task
 is assigned or the outcome stops being pending, and says so plainly if it never settles —

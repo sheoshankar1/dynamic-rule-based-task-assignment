@@ -121,6 +121,15 @@ export default function CreateTask() {
         <pre style={{ margin: 0, color: "var(--muted)" }}>
           {JSON.stringify(buildRule(), null, 2)}
         </pre>
+        {/* Clicking the selected department clears it, which is easy to do by
+            accident and produces a rule matching everyone. Say so rather than
+            forbidding it -- "anyone may do this" is a legitimate rule. */}
+        {!department && (
+          <div style={{ color: "var(--warn)", marginTop: 10 }}>
+            No department selected — this rule matches <strong>every user</strong>.
+            Click a department to narrow it.
+          </div>
+        )}
         <button className="go" disabled={busy}>
           {busy ? "Creating..." : "Create task"}
         </button>
