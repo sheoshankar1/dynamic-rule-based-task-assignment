@@ -1,9 +1,75 @@
 # System Explainer
 
-Each requirement from the brief, the solution built for it, and why that solution is
-necessary — stated as what breaks without it.
+The complete description of this system: every requirement from the brief, the solution built
+for it, and why that solution is necessary — stated as what breaks without it.
 
-Backend concepts are explained where they first appear.
+This is the single reference document. Backend concepts are explained where they first appear.
+
+| | |
+|---|---|
+| §A | Running it |
+| §B | Tech stack |
+| §0–2 | What it does, the assignment engine, selection |
+| §3–4 | Concurrency, recompute |
+| §5–6 | APIs, background processing |
+| §7–9 | Performance, auth, data model |
+| §10–11 | Exclusions, verification |
+| §12–15 | Consistency, assumptions, requirement traceability, evidence |
+
+---
+
+## A. Running it
+
+```bash
+docker compose up --build
+```
+
+| | |
+|---|---|
+| UI | http://localhost:5173 |
+| API docs (Swagger) | http://localhost:8000/docs |
+| OpenAPI schema | http://localhost:8000/schema |
+
+Logins after seeding: `manager` / `manager`, `admin` / `admin`, or any `userNNNN` / `demo`.
+
+Without Docker, against a local PostgreSQL:
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+createdb taskassign
+POSTGRES_HOST=/tmp POSTGRES_PORT=5432 .venv/bin/python manage.py migrate
+.venv/bin/python manage.py seed --users 200 --rules 8 --tasks 50
+.venv/bin/python manage.py test assignment
+```
+
+Celery runs jobs inline unless `CELERY_EAGER=0`, so the test suite and a bare `runserver`
+exercise the whole assignment path without a broker.
+
+**Seeding at benchmark scale**, parameterised on the two quantities the design is sensitive
+to — the number of distinct rules, and how many users each matches:
+
+```bash
+.venv/bin/python manage.py seed_scale --users 100000 --tasks 1000000 --rules 1000
+.venv/bin/python manage.py benchmark --iterations 400 --workers 8
+```
+
+> Every credential in this repository is a deliberate placeholder. `SECRET_KEY` defaults to
+> `dev-only-not-for-production`, the Postgres password never leaves the compose network, and
+> all are environment-overridable. §13 lists the security simplifications.
+
+---
+
+## B. Tech stack
+
+| Asked for | Used | Why |
+|---|---|---|
+| Python — Django or FastAPI | Django 4.2 + DRF | The work is model-heavy: migrations, a custom user model, an ORM for the majority of queries that are ordinary. FastAPI would mean assembling those separately, for no gain on the part that is actually hard — SQL that neither framework writes for you |
+| PostgreSQL | PostgreSQL 14 | Partial indexes, `RETURNING`, and mixed ASC/DESC composite indexes are all load-bearing here. The design does not port unchanged to MySQL |
+| Redis — caching and queues | Both | Celery broker, rule cache, single-flight lock, recompute debounce |
+| Celery / RQ / worker | Celery, beat in the same process | The two periodic jobs are low-frequency safety nets, not throughput work; a separate container would add operational surface for nothing |
+| JWT + refresh tokens | SimpleJWT | The UI refreshes once transparently on a 401, then stops rather than looping |
+| React | React 18 + Vite | Two screens; see §10 |
+| Docker and Docker Compose | Five services, verified running | §11 |
 
 ---
 
@@ -236,9 +302,9 @@ user is returned repeatedly.
 
 Measured on seeded data: **17 users tied on keys 1–3**. Key 4 decides between them.
 
-**Alternative considered.** Round-robin (single key) measured 24.7 ms against 31.8 ms for the
-four-key ordering — a 7 ms difference on a query whose cost was in the join plan, not the
-ordering. Four keys retained.
+**Alternative considered.** A single-key ordering was measured against the four-key ladder:
+24.7 ms versus 31.8 ms, a 7 ms difference on a query whose cost lay in the join plan rather
+than the ordering. The additional keys cost nothing measurable, so all four are retained.
 
 ### 2.2 No eligible users
 
@@ -777,3 +843,172 @@ transactions, and can be rebuilt from the tasks table.
 `docker compose up --build` runs all five services: PostgreSQL, Redis, web, worker, frontend.
 
 README §12 lists which claims are measured and which are reasoned.
+
+---
+
+## 12. Consistency model
+
+Stated with windows, because "eventually consistent" without one is not a specification.
+
+| Property | Guarantee | Why this level |
+|---|---|---|
+| Capacity cap | **Strong.** Enforced transactionally by the compare-and-set (§3) | An exceeded cap is a broken promise to an overloaded person, and nothing corrects it |
+| Assignment counters | **Strong.** Written only inside the assignment or completion transaction | If status and counters disagree, selection is skewed permanently with nothing to indicate why |
+| Stable eligibility | **Eventual**, bounded by queue latency — roughly one worker hop | A stale eligible set costs a delayed assignment, and the next event corrects it |
+| Pool drain | **Eventual**, same bound, with the sweep as the outer limit | Same reasoning; a dropped queue message is recoverable |
+| `/my-eligible-tasks` | **Strong.** Reads committed rows, no cache | It is a bounded index lookup; a cache would add staleness for no measurable gain |
+
+The asymmetry is deliberate: consistency is bought where a failure is permanent, and skipped
+where the system self-corrects.
+
+---
+
+## 13. Assumptions and open questions
+
+Nothing in this system fills a gap silently. Every quantity is **given** (stated in the brief),
+**derived** (follows from a given), **declared** (an assumption, marked), or **resolved** (a
+decision taken with the requester).
+
+### Declared assumptions
+
+| Assumption | If it is wrong |
+|---|---|
+| One assignee per task | The brief says "assigns the task to *the* eligible user". Multiple assignees change the counter semantics in §3 |
+| `active_task_count` counts every non-terminal task, `todo` and `in_progress` alike | Shifts when capacity frees |
+| `max_active_tasks` is per rule and optional; no global default | The brief's `< 5` is an example inside a rule, not a system setting |
+| `effort_hours` is an estimate set at creation and editable | Editing it adjusts committed hours but gates nothing, so it can never invalidate an existing assignment |
+| Departments are distributed evenly across users | Only used to bound rule selectivity at ≤ 0.25; skew raises it for large departments |
+| Storage is SSD | `random_page_cost = 1.1`. Wrong on spinning or high-latency network storage |
+| Single PostgreSQL instance | All sizing assumes one node — no sharding, no read replicas |
+| Manual reassignment is not supported | The brief's premise is that assignment is not manual |
+
+### Additions beyond the brief, and why
+
+| Addition | Why it was necessary |
+|---|---|
+| `id` as the fourth selection key | Account timestamps are not unique, so without it the ordering is not total and tied rows return arbitrarily. Measured: 17 users tied on the first three keys |
+| `effort_hours` on tasks | "Least loaded" measured in task count treats one 8-hour task as equal to four 30-minute ones |
+| `lifetime_hours` on users | Selection key 2; without it, equally-loaded users are separated only by account age |
+| `placement_attempted_at` on tasks | Distinguishes "the worker has not run" from "the worker ran and found nobody" — two states requiring opposite responses (§2.2) |
+| `created_by` on tasks | Records who authored a task; audit data |
+| `cancelled` status | The brief has only `done`. A cancelled task must free capacity **without** crediting delivered work |
+
+### Resolved with the requester
+
+| Question | Resolution |
+|---|---|
+| What does a Manager do? | Managers author rules and tasks. Admin is system administration |
+| "Eligible **and** assigned" in Story 2 | The conjunction — a user sees a task once assigned. No self-service pool |
+| Does priority preempt? | No. It orders the queue; it does not displace work in progress |
+| Ordering within a priority band | Oldest first |
+| Multi-department or multi-city rules | Not supported. One department, at most one location |
+
+### Unresolved
+
+| Question | Status |
+|---|---|
+| Actual distinct-rule count in production | Unknowable before the system runs. Measured instead: selection latency is flat across rule counts from 10² to 5×10³, so this quantity constrains storage rather than speed |
+| Expected request throughput | The brief gives a latency target with no load figure. Every measurement in §7 therefore publishes the concurrency and rate it was taken at, rather than asserting one |
+
+---
+
+## 14. Requirement traceability
+
+Every line of the brief against its implementation.
+
+### Core features
+
+| Requirement | Where | Section |
+|---|---|---|
+| User signup and login | `POST /auth/signup`, `/auth/login`, `/auth/refresh` | §8 |
+| Roles: Admin, Manager, User | `User.Role`, enforced per endpoint | §8 |
+| CRUD on tasks | `GET`/`POST /tasks/`, `GET`/`PATCH`/`DELETE /tasks/{id}` | §5 |
+| Status Todo → In Progress → Done | `PATCH` for open states, `/complete` for terminal | §4.3 |
+| Due dates and priority | `due_date`, `priority` | §9 |
+| Tasks are NOT manually assigned | No endpoint accepts an assignee; one function sets one | §2.4 |
+| Each task defines dynamic rules | `rules` on create, repointed on `PATCH` | §1 |
+
+### User profile attributes
+
+| Attribute | Field | Handling |
+|---|---|---|
+| Department | `department` | Stable — hashed, materialised |
+| Experience in years | `experience_years` | Stable |
+| Location | `location` | Stable |
+| Current number of assigned tasks | `active_task_count` | Volatile — live filter, never materialised |
+
+### User stories
+
+| Story | Where |
+|---|---|
+| 1 — Admin creates a task with rules; system assigns in background | §1, §2, §6 |
+| 1a — What if multiple eligible users? | §2.1 |
+| 1b — What if no eligible users? | §2.2 |
+| 2 — User views eligible tasks, highly optimised | §5 |
+| 3 — User data changes, eligibility recomputes | §4.1 |
+| 4 — Admin updates rules, recompute efficiently | §4.2 |
+
+### Required APIs
+
+| Required | Measured p95 |
+|---|---|
+| `POST /tasks/` | — |
+| `GET /tasks/{id}/eligible-users` | 1.65 ms |
+| `GET /my-eligible-tasks` | 0.38 ms |
+| `POST /tasks/recompute-eligibility` | 202 + job ids |
+
+### Deliverables
+
+| Deliverable | Status |
+|---|---|
+| Public GitHub repository | Done |
+| Docker setup | Done, verified running |
+| DB migrations | Done — 5 migrations, apply and reverse cleanly |
+| README explaining architecture, indexing, caching, rule engine, recompute | This document, §1–§7 |
+| Seed data | `seed` (demo, drives the real code paths) and `seed_scale` (benchmark) |
+| API documentation | OpenAPI at `/schema`, Swagger at `/docs`, no generation errors |
+
+---
+
+## 15. Evidence: measured versus reasoned
+
+Claims are separated by how they are supported. Everything measured was taken at
+100,000 users / 1,000,000 tasks / 15,384,332 eligibility rows unless noted.
+
+| Claim | Support |
+|---|---|
+| No sequential scan on any request-path query | **Measured.** The benchmark asserts it |
+| p95 ≤ 1.65 ms on both read endpoints, 8 workers | **Measured** |
+| p95 ≤ 0.81 ms on both assignment queries | **Measured** |
+| Eligibility rows = rules × selectivity × users | **Measured.** Predicted 15,380,000, actual 15,384,332 |
+| Eligibility storage is 162 bytes per row | **Measured.** 2,380 MB over 15.4M rows |
+| Two per-foreign-key indexes were redundant | **Measured.** Removing them saved 233 MB |
+| The fourth selection key is load-bearing | **Measured.** 17 users tied on keys 1–3 |
+| Additional selection keys cost nothing meaningful | **Measured.** 31.9 ms vs 24.7 ms, both dominated by the join plan |
+| Rule count constrains storage, not latency | **Measured.** p95 flat across rule counts 10² → 5×10³ |
+| The planner chooses the ordered-index walk unaided | **Measured.** No application-level plan switch is needed |
+| The selection index bloats and `VACUUM` will not reclaim it | **Measured.** 216 kB → 23 MB over 400k updates; `REINDEX` → 112 kB |
+| A waiting P0 is never overtaken | **Tested.** The failure is reproduced against the two-path design, then the fix proven |
+| The capacity cap holds under concurrency | **Tested.** 16 threads, 1 winner, 15 losers, no errors |
+| The two rule evaluators agree | **Tested** exhaustively over a generated rule space |
+| Write load is human-paced | **Derived**, not measured — tasks are authored manually, so assignment rate is bounded by human activity |
+| End-to-end HTTP latency | **Not measured.** All figures are SQL-layer and exclude HTTP, serialisation and network |
+
+### Measurement caveats
+
+The benchmark seed correlates rule membership with load in a way real data would not, which
+distorts how far the index walk travels. Direction and order of magnitude hold; exact
+latencies would need a realistic distribution.
+
+`seed_scale` writes the *outcome* of assignment in bulk SQL rather than driving the assigner,
+because placing a million tasks individually would take hours. A successful run of it is not
+evidence that assignment is correct — the test suite is.
+
+### Claims withdrawn after measurement
+
+| Claim | Outcome |
+|---|---|
+| `random_page_cost = 1.1` is worth roughly 2× | **Withdrawn.** True on a synthetic schema; on the real one it moved p95 by 0.02 ms. The setting is retained because 4.0 models the wrong storage, but it is not load-bearing |
+| `/my-eligible-tasks` needs a payload cache for its fan-out | **Withdrawn.** Under the conjunction reading (§5) it is a bounded index lookup at 0.38 ms |
+| A per-rule eligible-set cache is needed | **Withdrawn.** The query it would replace runs at 1.65 ms and the capacity filter must reach the database regardless |
+| An application-level query plan switch is needed | **Withdrawn.** The planner selects the intended plan without help |
