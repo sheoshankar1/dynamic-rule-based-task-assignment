@@ -214,13 +214,22 @@ class TaskCreateView(APIView):
                 rule=rule, created_by=request.user, **serializer.validated_data
             )
 
-        # A brand-new fingerprint has no eligible set yet, so materialise before
-        # placing. A reused rule is already warm: no recompute at all.
+        # Exactly one job, never two. Materialisation drains its own rule's pool
+        # (README section 7.2), so for a new fingerprint `place_task` would be a
+        # second enqueue doing work the first job already does. Each enqueue is
+        # a broker round trip on the request path, and this endpoint has the
+        # tightest latency budget in the system.
         if created or rule.materialized_at is None:
-            tasks.materialize_rule.delay(rule.id)
-        tasks.place_task.delay(task.id)
+            tasks.materialize_rule.delay(rule.id)      # materialises, then places
+        else:
+            tasks.place_task.delay(task.id)            # already warm, just place
 
-        task.refresh_from_db()
+        # With a real broker, placement has not run when this response is built,
+        # so re-reading the row cannot show an assignee -- it is a round trip
+        # that always returns what we already have. Only worth it when jobs ran
+        # inline and the row really did change.
+        if settings.CELERY_TASK_ALWAYS_EAGER:
+            task.refresh_from_db()
         return Response(
             {
                 "id": task.id,

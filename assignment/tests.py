@@ -1101,3 +1101,46 @@ class TokenRevocationTests(TestCase):
         from django.conf import settings
         self.assertLessEqual(
             settings.SIMPLE_JWT["ACCESS_TOKEN_LIFETIME"].total_seconds(), 900)
+
+
+class CreatePathCostTests(TestCase):
+    """Task creation carries the tightest latency budget, so the request path
+    is kept to one broker round trip and no redundant queries."""
+
+    def setUp(self):
+        self.manager = make_user("mgr", role=User.Role.MANAGER, dept="Operations")
+        make_user("worker", dept="Finance")
+
+    def _create(self, title, rules):
+        client = APIClient()
+        client.force_authenticate(user=self.manager)
+        return client.post("/tasks/", {
+            "title": title, "priority": 2, "effort_hours": "1.0", "rules": rules,
+        }, format="json")
+
+    def test_a_new_rule_enqueues_materialisation_only(self):
+        """Materialisation drains its own pool, so a second place_task enqueue
+        would pay a broker round trip to do work already being done."""
+        with mock.patch.object(views.tasks.materialize_rule, "delay") as mat, \
+             mock.patch.object(views.tasks.place_task, "delay") as place:
+            res = self._create("new", {"department": "Finance",
+                                       "experience_years": {"gte": 1}})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(mat.call_count, 1)
+        self.assertEqual(place.call_count, 0)
+
+    def test_a_reused_rule_enqueues_placement_only(self):
+        rule, _ = services.get_or_create_rule({"department": "Finance"})
+        services.materialize_rule(rule.id)
+        with mock.patch.object(views.tasks.materialize_rule, "delay") as mat, \
+             mock.patch.object(views.tasks.place_task, "delay") as place:
+            res = self._create("reused", {"department": "Finance"})
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(mat.call_count, 0)
+        self.assertEqual(place.call_count, 1)
+
+    def test_a_task_on_a_new_rule_still_gets_assigned(self):
+        """The enqueue reduction must not lose the placement."""
+        res = self._create("still assigned", {"department": "Finance"})
+        task = Task.objects.get(pk=res.json()["id"])
+        self.assertIsNotNone(task.assignee_id)

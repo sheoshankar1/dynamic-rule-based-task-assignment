@@ -37,6 +37,9 @@ class Command(BaseCommand):
         p.add_argument("--workers", type=int, default=8)
         p.add_argument("--find-capacity", action="store_true",
                        help="ramp concurrency until p95 exceeds the budget")
+        p.add_argument("--ramp-create", action="store_true",
+                       help="ramp POST /tasks/ specifically; creation carries "
+                            "the same budget and is the write path")
 
     # -- plumbing -----------------------------------------------------------
 
@@ -57,17 +60,24 @@ class Command(BaseCommand):
         return self._call(base, "/auth/login",
                           body={"username": username, "password": password})["access"]
 
-    def _drive(self, base, token, path, seconds, workers):
-        """Hold `workers` concurrent clients for `seconds`, return latencies."""
+    def _drive(self, base, token, path, seconds, workers, body_factory=None):
+        """Hold `workers` concurrent clients for `seconds`, return latencies.
+
+        `body_factory(i)` makes this usable for writes as well as reads -- task
+        creation is a request-path operation with the same latency budget, and
+        measuring only reads would leave the busiest code path unmeasured.
+        """
         latencies, errors, lock = [], [], threading.Lock()
         stop = time.perf_counter() + seconds
 
         def run():
-            local = []
+            local, n = [], 0
             while time.perf_counter() < stop:
+                body = body_factory(n) if body_factory else None
+                n += 1
                 t0 = time.perf_counter()
                 try:
-                    self._call(base, path, token)
+                    self._call(base, path, token, body)
                     local.append((time.perf_counter() - t0) * 1000)
                 except (urllib.error.URLError, TimeoutError) as exc:
                     with lock:
@@ -121,10 +131,30 @@ class Command(BaseCommand):
         self.stdout.write(f"  {'endpoint':<26}{'p50':>9}{'p95':>9}{'p99':>9}"
                           f"{'max':>9}{'rate':>12}{'errors':>8}")
 
-        for label, path in endpoints:
-            self._drive(base, token, path, 1, workers)          # warm
+        # Task creation is on the request path and carries the same budget, so
+        # it is measured too -- both against a rule that already exists (the
+        # common case, no materialisation) and against a brand-new fingerprint.
+        DEPTS = ["Finance", "HR", "IT", "Operations"]
+        endpoints += [
+            ("POST /tasks/ (rule reused)", "/tasks/",
+             lambda i: {"title": f"bench {i}", "priority": 2,
+                        "effort_hours": "1.0",
+                        "rules": {"department": "Finance",
+                                  "max_active_tasks": 5}}),
+            ("POST /tasks/ (new rule)", "/tasks/",
+             lambda i: {"title": f"bench new {i}", "priority": 2,
+                        "effort_hours": "1.0",
+                        "rules": {"department": DEPTS[i % 4],
+                                  "experience_years": {"gte": (i * 7) % 13},
+                                  "max_active_tasks": 5}}),
+        ]
+
+        for entry in endpoints:
+            label, path = entry[0], entry[1]
+            factory = entry[2] if len(entry) > 2 else None
+            self._drive(base, token, path, 1, workers, factory)   # warm
             lat, errs, rate = self._drive(base, token, path,
-                                          o["duration"], workers)
+                                          o["duration"], workers, factory)
             if not lat:
                 reason = errs[0] if errs else "unknown"
                 self.stdout.write(self.style.ERROR(
@@ -137,6 +167,8 @@ class Command(BaseCommand):
 
         if o["find_capacity"]:
             self._find_capacity(base, token, o["duration"])
+        if o["ramp_create"]:
+            self._ramp_create(base, token, o["duration"])
 
         self.stdout.write("")
 
@@ -174,3 +206,41 @@ class Command(BaseCommand):
         else:
             self.stdout.write(self.style.WARNING(
                 "\n  The budget was exceeded at the lowest concurrency tested."))
+
+    def _ramp_create(self, base, token, duration):
+        """Find the concurrency at which task creation leaves the budget.
+
+        Creation is the write path and carries the same 200ms target. Reported
+        as a ramp rather than a single number because a latency figure without
+        its concurrency says nothing.
+        """
+        self.stdout.write(self.style.SUCCESS(
+            f"\nCREATION RAMP  (POST /tasks/, budget {BUDGET_MS}ms)"))
+        self.stdout.write(f"  {'clients':>9}{'p50':>10}{'p95':>10}{'rate':>11}"
+                          f"{'errors':>8}")
+
+        body = lambda i: {"title": f"ramp {i}", "priority": 2,
+                          "effort_hours": "1.0",
+                          "rules": {"department": "Finance",
+                                    "max_active_tasks": 5}}
+        best = None
+        for clients in (1, 2, 4, 8, 16):
+            lat, errs, rate = self._drive(base, token, "/tasks/", duration,
+                                          clients, body)
+            if not lat:
+                self.stdout.write(f"  {clients:>9}  no successful requests")
+                break
+            p50, p95 = statistics.median(lat), self._pct(lat, 0.95)
+            ok = p95 <= BUDGET_MS and not errs
+            self.stdout.write(
+                f"  {clients:>9}{p50:>9.1f}ms{p95:>9.1f}ms{rate:>8.0f}/s"
+                f"{len(errs):>8}{'' if ok else '   <- over budget'}")
+            if ok:
+                best = (clients, rate, p95)
+        if best:
+            self.stdout.write(self.style.SUCCESS(
+                f"\n  Creation stays inside {BUDGET_MS}ms up to {best[0]} "
+                f"concurrent authors: {best[1]:.0f} tasks/s at p95 {best[2]:.1f}ms."))
+        else:
+            self.stdout.write(self.style.WARNING(
+                f"\n  Creation exceeded {BUDGET_MS}ms even at one client."))

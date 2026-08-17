@@ -31,10 +31,14 @@ services:
       POSTGRES_PASSWORD: taskassign
       REDIS_URL: redis://redis:6379/0
       CELERY_EAGER: "0"
+    # gunicorn, not runserver. The dev server handles one request at a time,
+    # which made latency a function of queue depth rather than of the work
+    # being done -- task creation measured p95 234ms while the server-side work
+    # was 3ms.
     command: >
       sh -c "python manage.py migrate &&
              python manage.py seed --if-empty --users 200 &&
-             python manage.py runserver 0.0.0.0:8000"
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --threads 2 --access-logfile - --error-logfile -"
     ports: ["8000:8000"]
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:8000/schema')\""]

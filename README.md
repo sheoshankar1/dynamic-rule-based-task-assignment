@@ -997,10 +997,52 @@ python manage.py benchmark_http --duration 6 --workers 8 --find-capacity
 handling. That is the honest shape of the system: the design work described in this document
 made the database cost negligible, and what remains is serving overhead.
 
-**These figures are `runserver`, Django's development server.** It is not a production
-configuration — single process, no worker pool, debug middleware active. A production WSGI
-server behind a process manager would change these numbers substantially. The SQL-layer figures
-are the ones that describe the *design*; these describe the current deployment.
+**Served by gunicorn**, four workers with two threads each. The stack originally ran Django's
+`runserver`, which handles one request at a time and made latency a function of queue depth
+rather than of the work being done — creation measured p95 234 ms there against 3 ms of
+server-side work.
+
+### Task creation against the budget
+
+Creation is the write path and carries the same 200 ms target. Reads were measured above;
+this is the ramp for `POST /tasks/`:
+
+| Concurrent authors | p50 | p95 | rate |
+|---|---|---|---|
+| 1 | 39.5 ms | 78.5 ms | 21/s |
+| 2 | 47.1 ms | 102.7 ms | 35/s |
+| **4** | **65.4 ms** | **124.6 ms** | **55/s** |
+| 8 | 103.1 ms | 213.2 ms | 67/s — over budget |
+| 16 | 157.9 ms | 535.8 ms | 67/s — over budget |
+
+```bash
+python manage.py benchmark_http --ramp-create
+```
+
+**Creation stays inside 200 ms up to 4 concurrent authors, at 55 tasks/s and p95 124.6 ms.**
+That is 198,000 tasks/hour — the brief's entire 1,000,000-task corpus authored in about five
+hours of sustained writing. Tasks are authored by people, so the realistic rate is orders of
+magnitude below the measured ceiling.
+
+**Server-side work is 3 ms of it.** Profiled individually: rule lookup 0.3 ms, task insert
+0.5 ms, enqueue 0.8–1.4 ms, cached rule spec 0.2 ms. The remaining latency is request handling
+and, past 4 clients, queueing — not the assignment design.
+
+**Two changes came out of measuring this:**
+
+- **One broker round trip per creation, not two.** A new fingerprint used to enqueue both
+  `materialize_rule` and `place_task`. Since materialisation drains its own rule's pool, the
+  second enqueue paid a round trip to do work already in progress. Now exactly one job is
+  queued in either case, and tests assert which.
+- **A guaranteed-useless query removed.** The view re-read the task after queueing placement.
+  With a real broker that read cannot show an assignee, because the worker has not run — so it
+  only happens when jobs run inline.
+
+**Measurement caveat.** PostgreSQL, Redis, the Celery worker, four gunicorn workers *and the
+load generator* all share one 4-CPU VM, so the generator competes with the server it is
+measuring. These figures are pessimistic; a load generator on separate hardware would give the
+server more headroom. The shape — flat p50 until saturation, then a sharp tail — is what
+matters more than the absolute numbers.
 
 ### Sustainable throughput
 
@@ -1213,7 +1255,7 @@ assignment/
   tasks.py         37   Celery entry points
   views.py        588   validate, delegate, serialise
   urls.py          25
-  tests.py             77 tests
+  tests.py             80 tests
   management/commands/
     seed.py            demo data, drives the real service layer
     seed_scale.py      benchmark data, parameterised on rule count and selectivity
@@ -1641,7 +1683,7 @@ would need a realistic distribution.
 
 # Appendix D — Verification
 
-**77 tests**, PostgreSQL 14. They cover the paths where an error is not visible at runtime:
+**80 tests**, PostgreSQL 14. They cover the paths where an error is not visible at runtime:
 
 | Test area | What it prevents |
 |---|---|
