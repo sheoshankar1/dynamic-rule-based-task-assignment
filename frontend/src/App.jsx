@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { isAuthed, clearTokens, currentUser } from "./api.js";
+import { isAuthed, logout, currentUser } from "./api.js";
 import Login from "./views/Login.jsx";
 import CreateTask from "./views/CreateTask.jsx";
 import MyTasks from "./views/MyTasks.jsx";
@@ -44,7 +44,7 @@ export default function App() {
         {user && <span className="tag" style={{ alignSelf: "center", marginLeft: 4 }}>
           {user.username} · {user.role}
         </span>}
-        <button onClick={() => { clearTokens(); setAuthed(false); }}>Sign out</button>
+        <button onClick={() => { logout(); setAuthed(false); }}>Sign out</button>
       </nav>
       <View />
     </div>

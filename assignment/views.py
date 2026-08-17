@@ -18,7 +18,9 @@ from drf_spectacular.utils import (
 )
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from . import services, tasks
@@ -624,3 +626,28 @@ class RoleTokenSerializer(TokenObtainPairSerializer):
 @extend_schema(summary="Obtain a JWT pair; the access token carries role")
 class RoleTokenObtainPairView(TokenObtainPairView):
     serializer_class = RoleTokenSerializer
+
+
+class LogoutSerializer(serializers.Serializer):
+    refresh = serializers.CharField()
+
+
+@extend_schema(
+    request=LogoutSerializer,
+    responses={205: None},
+    summary="Sign out; blacklists the refresh token",
+    description="Access tokens are stateless and remain valid until they "
+                "expire, which is why they are short-lived. Blacklisting the "
+                "refresh token stops the session being extended.",
+)
+class LogoutView(APIView):
+    def post(self, request):
+        serializer = LogoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            RefreshToken(serializer.validated_data["refresh"]).blacklist()
+        except TokenError:
+            # Already blacklisted, or malformed. Signing out twice is not an
+            # error worth reporting to someone who is trying to leave.
+            pass
+        return Response(status=status.HTTP_205_RESET_CONTENT)

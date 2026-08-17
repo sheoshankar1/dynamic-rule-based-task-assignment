@@ -18,6 +18,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
     "drf_spectacular",
     "drf_spectacular_sidecar",
     "assignment",
@@ -90,6 +91,19 @@ SPECTACULAR_SETTINGS = {
 # The dev frontend runs on its own origin (Vite, :5173) and calls this API.
 CORS_ALLOWED = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
 
+
+from datetime import timedelta
+
+# Sign-out has to actually revoke something. Access tokens are stateless and
+# stay valid until they expire, so they are kept short and the refresh token is
+# blacklisted on logout -- that caps a stolen token's usefulness at the access
+# lifetime instead of the refresh lifetime.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+}
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 CELERY_BROKER_URL = REDIS_URL

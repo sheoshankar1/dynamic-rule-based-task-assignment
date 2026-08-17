@@ -55,7 +55,10 @@ class User(AbstractUser):
             ),
         ]
 
-    STABLE_FIELDS = ("department", "experience_years", "location")
+    # `role` is stable in the same sense as the others -- it changes on an HR
+    # event, not on every assignment -- so it is materialised, and a change to
+    # it recomputes eligibility like any other stable attribute.
+    STABLE_FIELDS = ("department", "experience_years", "location", "role")
 
     def stable_snapshot(self):
         return {f: getattr(self, f) for f in self.STABLE_FIELDS}

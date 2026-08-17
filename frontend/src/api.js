@@ -29,6 +29,26 @@ export function clearTokens() {
   localStorage.removeItem(REFRESH);
 }
 
+// Forgetting the token locally leaves it usable by anyone who copied it, so
+// sign-out revokes the refresh token server-side as well. Fire and forget: a
+// failed revoke must not trap someone on a screen they are trying to leave.
+export async function logout() {
+  const refresh = localStorage.getItem(REFRESH);
+  const token = getToken();
+  clearTokens();
+  if (!refresh) return;
+  try {
+    await fetch("/auth/logout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ refresh }),
+    });
+  } catch {
+    /* already signed out locally; nothing useful to report */
+  }
+}
+
 async function request(path, { method = "GET", body, retry = true } = {}) {
   const headers = { "Content-Type": "application/json" };
   const token = getToken();

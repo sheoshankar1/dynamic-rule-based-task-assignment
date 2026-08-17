@@ -107,6 +107,12 @@ def materialize_rule(rule_id):
 def _materialize_rule(rule_id):
     rule = Rule.objects.get(pk=rule_id)
     where, params = to_sql(rule.predicates, alias="u")
+    # Managers author work and Admins administer the system; neither receives
+    # assignments. This is policy, not a rule predicate, so it lives here
+    # rather than in the rule engine -- a rule describes which *people* qualify,
+    # not which roles the product routes work to.
+    where = f"({where}) AND u.role = %s"
+    params = [*params, User.Role.USER]
 
     with transaction.atomic():
         RuleEligibleUser.objects.filter(rule_id=rule_id).delete()
@@ -154,9 +160,12 @@ def recompute_user(user_id):
     surface, and slower at this cardinality.
     """
     user = User.objects.get(pk=user_id)
-    should = {
-        r.id for r in Rule.objects.all() if matches(r.predicates, user)
-    }
+    # Same policy as materialisation: a user who is not a recipient is eligible
+    # for nothing, and promoting someone to Manager must remove them from every
+    # eligible set rather than leaving stale rows behind.
+    should = set()
+    if user.role == User.Role.USER:
+        should = {r.id for r in Rule.objects.all() if matches(r.predicates, user)}
     current = set(
         RuleEligibleUser.objects.filter(user_id=user_id).values_list(
             "rule_id", flat=True

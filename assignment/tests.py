@@ -993,3 +993,111 @@ class UncappedRuleTests(TestCase):
         self.assertEqual(
             Task.objects.filter(rule=self.rule, assignee__isnull=True)
             .exclude(status__in=Task.TERMINAL).count(), 25)
+
+
+class RecipientRoleTests(TestCase):
+    """Managers author work and Admins administer; neither receives it.
+
+    Before this, a Manager whose department matched their own rule was a
+    legitimate candidate and could be auto-assigned the task they had just
+    written.
+    """
+
+    def setUp(self):
+        self.manager = make_user("mgr", role=User.Role.MANAGER, dept="Finance")
+        self.admin = make_user("adm", role=User.Role.ADMIN, dept="Finance")
+        self.worker = make_user("worker", dept="Finance")
+        self.rule, _ = services.get_or_create_rule(
+            {"department": "Finance", "max_active_tasks": 5})
+
+    def test_only_users_are_materialised_as_eligible(self):
+        services.materialize_rule(self.rule.id)
+        eligible = set(RuleEligibleUser.objects.filter(rule=self.rule)
+                       .values_list("user__username", flat=True))
+        self.assertEqual(eligible, {"worker"})
+
+    def test_a_manager_is_not_assigned_the_task_they_authored(self):
+        services.materialize_rule(self.rule.id)
+        task = Task.objects.create(
+            title="authored by a Finance manager", priority=0,
+            effort_hours=Decimal("1.0"), rule=self.rule, created_by=self.manager)
+        self.assertEqual(services.place_task(task.id), self.worker.id)
+
+    def test_promoting_a_user_removes_them_from_every_eligible_set(self):
+        services.materialize_rule(self.rule.id)
+        self.assertTrue(RuleEligibleUser.objects.filter(
+            rule=self.rule, user=self.worker).exists())
+
+        self.worker.role = User.Role.MANAGER
+        self.worker.save(update_fields=["role"])
+        services.recompute_user(self.worker.pk)
+
+        self.assertFalse(RuleEligibleUser.objects.filter(
+            rule=self.rule, user=self.worker).exists())
+
+    def test_demoting_a_manager_makes_them_eligible_again(self):
+        services.materialize_rule(self.rule.id)
+        self.manager.role = User.Role.USER
+        self.manager.save(update_fields=["role"])
+        services.recompute_user(self.manager.pk)
+        self.assertTrue(RuleEligibleUser.objects.filter(
+            rule=self.rule, user=self.manager).exists())
+
+    def test_role_change_is_treated_as_a_stable_attribute_change(self):
+        with mock.patch.object(signals, "schedule_recompute") as sched:
+            u = User.objects.get(pk=self.worker.pk)
+            u.role = User.Role.MANAGER
+            u.save(update_fields=["role"])
+        sched.assert_called_once_with(self.worker.pk)
+
+
+class TokenRevocationTests(TestCase):
+    """Sign-out has to revoke something.
+
+    Access tokens are stateless and stay valid until they expire, so they are
+    kept short (15 minutes) and the refresh token is blacklisted on logout.
+    Without this, a copied token remained usable for the full refresh lifetime
+    after the user believed they had signed out.
+    """
+
+    def setUp(self):
+        self.user = make_user("revoke", dept="Finance")
+
+    def _tokens(self):
+        res = APIClient().post("/auth/login",
+                               {"username": "revoke", "password": "x"},
+                               format="json")
+        self.assertEqual(res.status_code, 200)
+        return res.json()
+
+    def test_refresh_works_before_logout(self):
+        t = self._tokens()
+        res = APIClient().post("/auth/refresh", {"refresh": t["refresh"]},
+                               format="json")
+        self.assertEqual(res.status_code, 200)
+
+    def test_refresh_is_refused_after_logout(self):
+        t = self._tokens()
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION="Bearer " + t["access"])
+        self.assertEqual(
+            client.post("/auth/logout", {"refresh": t["refresh"]},
+                        format="json").status_code, 205)
+
+        res = APIClient().post("/auth/refresh", {"refresh": t["refresh"]},
+                               format="json")
+        self.assertEqual(res.status_code, 401)
+
+    def test_signing_out_twice_is_not_an_error(self):
+        t = self._tokens()
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION="Bearer " + t["access"])
+        for _ in range(2):
+            self.assertEqual(
+                client.post("/auth/logout", {"refresh": t["refresh"]},
+                            format="json").status_code, 205)
+
+    def test_access_tokens_are_short_lived(self):
+        from django.conf import settings
+        self.assertLessEqual(
+            settings.SIMPLE_JWT["ACCESS_TOKEN_LIFETIME"].total_seconds(), 900)

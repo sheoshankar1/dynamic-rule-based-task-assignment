@@ -977,11 +977,47 @@ python manage.py benchmark --iterations 400 --workers 8
   reporting it, because a plan regression is invisible until the table grows.
 - Warmup runs are discarded so the figures describe steady state rather than cold cache.
 
-### What the numbers exclude
+### End to end, over HTTP
 
-These are **SQL-layer** measurements. They exclude HTTP handling, JSON serialisation and network,
-so end-to-end latency is higher. Stated in the benchmark's own docstring so the figure cannot be
-quoted as end-to-end by accident.
+The table above is the **SQL layer**. Measured through the full stack — WSGI, DRF
+serialisation, network — 8 concurrent clients:
+
+| Endpoint | p50 | p95 | p99 | rate |
+|---|---|---|---|---|
+| `GET /my-eligible-tasks` | 56.5 ms | 91.1 ms | 319.3 ms | 126/s |
+| `GET /tasks/?limit=50` | 85.6 ms | 506.6 ms | 913.1 ms | 59/s |
+| `GET /tasks/{id}` | 66.8 ms | 94.4 ms | 112.9 ms | 117/s |
+
+```bash
+python manage.py benchmark_http --duration 6 --workers 8 --find-capacity
+```
+
+**The database is not the bottleneck; the application server is.** `/my-eligible-tasks` costs
+1.46 ms at the SQL layer and 91 ms over HTTP — roughly 60× the difference, all of it request
+handling. That is the honest shape of the system: the design work described in this document
+made the database cost negligible, and what remains is serving overhead.
+
+**These figures are `runserver`, Django's development server.** It is not a production
+configuration — single process, no worker pool, debug middleware active. A production WSGI
+server behind a process manager would change these numbers substantially. The SQL-layer figures
+are the ones that describe the *design*; these describe the current deployment.
+
+### Sustainable throughput
+
+The brief gives a latency target with no load figure. Rather than inventing one, the benchmark
+ramps concurrency until p95 leaves the budget:
+
+| Concurrent clients | p95 | rate |
+|---|---|---|
+| 1 | 15.7 ms | 69/s |
+| 4 | 57.7 ms | 111/s |
+| 8 | 100.9 ms | 113/s |
+| **16** | **172.6 ms** | **115/s** |
+| 32 | 1179.4 ms | 119/s — budget exceeded |
+
+**Sustains 115 req/s at 16 concurrent clients with p95 172.6 ms, inside the 200 ms budget.**
+Beyond that, throughput stops rising and latency degrades sharply — the queue is saturated, so
+extra clients only wait. Again, this is `runserver`'s ceiling, not the design's.
 
 ## 6.3 The cost model was checked, not trusted
 
@@ -1177,7 +1213,7 @@ assignment/
   tasks.py         37   Celery entry points
   views.py        588   validate, delegate, serialise
   urls.py          25
-  tests.py             68 tests
+  tests.py             77 tests
   management/commands/
     seed.py            demo data, drives the real service layer
     seed_scale.py      benchmark data, parameterised on rule count and selectivity
@@ -1428,17 +1464,34 @@ against.
 
 ## Authentication and authorization
 
-| Role | Permissions |
-|---|---|
-| Admin | System administration, recompute endpoint |
-| Manager | Authors tasks and rules; edits task fields |
-| User | Receives tasks; moves own tasks between todo and in_progress |
+| Role | Permissions | Receives assignments? |
+|---|---|---|
+| Admin | System administration, recompute endpoint | No |
+| Manager | Authors tasks and rules; edits task fields | No |
+| User | Receives tasks; moves own tasks between todo and in_progress | **Yes** |
+
+**Only Users receive work.** Eligibility materialisation filters on `role = 'user'`, so a
+Manager whose department matches their own rule is not a candidate for the task they just
+wrote. This is policy rather than a rule predicate — a rule describes which *people* qualify,
+not which roles the product routes work to — so it lives in the service layer, not the rule
+engine.
+
+`role` is therefore a **stable** attribute: it changes on an HR event, not on every assignment,
+so it is materialised like the others, and promoting a User to Manager removes them from every
+eligible set rather than leaving stale rows behind.
 
 Creating a user triggers eligibility evaluation, so a new account can immediately receive pooled
 work — this is the "user created" event from §7.2, not signup-specific logic.
 
+**Sign-out revokes.** Access tokens are stateless and stay valid until they expire, so they are
+kept short — **15 minutes** — and `POST /auth/logout` blacklists the refresh token. Refresh
+rotation is on with blacklist-after-rotation, so a captured refresh token is single-use. That
+caps a stolen credential's usefulness at the access lifetime instead of the refresh lifetime.
+Signing out twice is not an error.
+
 **Known limitation.** Tokens are stored in `localStorage`, which is exposed to XSS. httpOnly
-cookies with CSRF protection would be used in production.
+cookies with CSRF protection would be used in production. The short access lifetime above
+limits the blast radius; it does not remove the exposure.
 
 ---
 
@@ -1486,7 +1539,7 @@ marked), or **resolved** (decided with the requester).
 | Question | Status |
 |---|---|
 | Actual distinct-rule count in production | Unknowable before the system runs. Measured instead: latency is flat across rule counts 10² → 5×10³, so this constrains storage rather than speed |
-| Expected request throughput | The brief gives a latency target with no load figure, so every measurement publishes the concurrency it was taken at |
+| ~~Expected request throughput~~ | **Closed.** The brief gives no load figure, so the benchmark measures the rate the system sustains inside the budget instead: 115 req/s at 16 clients, p95 172.6 ms ([§6.2](#62-measured)) |
 
 ## Deliberate exclusions
 
@@ -1567,7 +1620,7 @@ Claims separated by how they are supported. Measurements at 100,000 users / 1,00
 | The capacity cap holds under concurrency | **Tested.** 16 threads, 1 winner, 15 losers, no errors |
 | The two rule evaluators agree | **Tested** exhaustively over a generated rule space |
 | Write load is human-paced | **Derived**, not measured — tasks are authored manually |
-| End-to-end HTTP latency | **Not measured.** All figures are SQL-layer |
+| End-to-end HTTP latency | **Measured.** p95 91 ms on `/my-eligible-tasks` over HTTP against 1.46 ms at the SQL layer — the gap is request handling, on `runserver` |
 
 ## Measurement caveats
 
@@ -1588,7 +1641,7 @@ would need a realistic distribution.
 
 # Appendix D — Verification
 
-**68 tests**, PostgreSQL 14. They cover the paths where an error is not visible at runtime:
+**77 tests**, PostgreSQL 14. They cover the paths where an error is not visible at runtime:
 
 | Test area | What it prevents |
 |---|---|
