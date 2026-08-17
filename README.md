@@ -101,7 +101,7 @@ Every endpoint is also callable interactively from Swagger at http://localhost:8
 docker compose exec web python manage.py test assignment
 ```
 
-56 tests, about 10 seconds in the container. They need no broker.
+80 tests, about 10 seconds in the container. They need no broker.
 
 ### Reproducing the performance figures
 
@@ -112,6 +112,17 @@ docker compose exec web python manage.py benchmark --iterations 400 --workers 8
 
 The seed takes about 5 minutes and replaces the demo data. The benchmark prints the table in
 [§6.2](#62-measured) and asserts there is no sequential scan on any request-path query.
+
+That measures the database layer. For end-to-end latency over HTTP, including task creation
+against the 200 ms budget:
+
+```bash
+python manage.py benchmark_http --duration 8 --workers 8 --ramp-create --find-capacity
+```
+
+Run this from the host, not inside the container — it drives the API as a client would.
+`--ramp-create` increases concurrent authors until creation leaves the budget; `--find-capacity`
+does the same for reads.
 
 ### If something does not start
 
@@ -1374,7 +1385,7 @@ Six atomic blocks, each wrapping one invariant:
 
 ## 8.8 Testing strategy
 
-56 tests, chosen by a single criterion: **does a defect here fail loudly at runtime?** If yes, it
+80 tests, chosen by a single criterion: **does a defect here fail loudly at runtime?** If yes, it
 is not tested. If no, it is.
 
 | Tested | Why |
