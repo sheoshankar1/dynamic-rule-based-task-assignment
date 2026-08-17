@@ -12,12 +12,38 @@ Backend concepts are explained where they first appear.
 A task carries a **rule** describing who may do it. No one selects an assignee. The system
 computes which users satisfy the rule and assigns the task automatically.
 
-```
-task + rule  ──►  eligible users  ──►  one assignee
-                  (computed)          (selected by a fixed order)
+```mermaid
+flowchart LR
+    T["task + rule"] --> E["eligible users<br/>(computed)"] --> A["one assignee<br/>(fixed selection order)"]
 ```
 
 Scale: 100,000 users, 1,000,000 tasks.
+
+### Components
+
+```mermaid
+flowchart LR
+    B["Browser<br/>React + Vite :5173"]
+    W["Django + DRF :8000<br/>request path"]
+    K["Celery worker + beat<br/>background path"]
+    R[("Redis<br/>queue · cache · locks")]
+    P[("PostgreSQL<br/>system of record")]
+
+    B -->|"HTTP, proxied through Vite"| W
+    W -->|"reads and writes"| P
+    W -->|"queues jobs"| R
+    R -->|"delivers jobs"| K
+    K -->|"reads and writes"| P
+    K -->|"locks, cache"| R
+    W -->|"rule cache, debounce"| R
+
+    classDef store fill:#1b1e26,stroke:#5b8def,color:#e6e8ee
+    class R,P store
+```
+
+The split between the two paths is the load-bearing part: **no assignment decision is ever
+made on the request path.** The web process saves a task and queues work; the worker decides
+who gets it.
 
 ---
 
@@ -31,8 +57,26 @@ Scale: 100,000 users, 1,000,000 tasks.
 canonical form, hashed with SHA-256, and the hash is the rule's identity. Two tasks whose
 rules produce the same hash share one stored eligible set.
 
+```mermaid
+flowchart LR
+    J["rule JSON"] --> C["canonicalise<br/>sort keys, flatten,<br/>drop empties"] --> H["sha256"] --> D{"hash<br/>already<br/>stored?"}
+    D -->|yes| RE["reuse it<br/>zero work"]
+    D -->|no| CO["compute the eligible set once"]
 ```
-rule JSON ──► canonicalise ──► sha256 ──► reuse existing, or compute once
+
+The difference the hash makes:
+
+```mermaid
+flowchart TB
+    subgraph R1["Per-task storage — rejected"]
+        direction LR
+        TA["1,000,000 tasks"] -->|"each keeps its own list"| EA["× ~5,000 users<br/>= 5,000,000,000 rows"]
+    end
+    subgraph R2["Per-rule storage — built"]
+        direction LR
+        TB["1,000,000 tasks"] -->|"hash collapses them onto"| RB["~1,000 distinct rules"]
+        RB -->|"each keeps one list"| EB["= 15,384,332 rows<br/>(measured)"]
+    end
 ```
 
 **Why needed.** Storing eligibility per task means:
@@ -79,6 +123,16 @@ Canonicalisation is what makes deduplication reliable rather than accidental.
 | Experience | HR event | Stored |
 | Location | HR event | Stored |
 | Active task count | Every assignment and completion | **Not stored.** Applied as a live filter at query time |
+
+```mermaid
+flowchart TB
+    R["Rule predicates"] --> S["department<br/>experience_years<br/>location"]
+    R --> V["max_active_tasks"]
+    S -->|"hashed and materialised<br/>changes on HR events"| T[("rule_eligible_user")]
+    V -->|"never stored<br/>changes on every assignment"| L["live WHERE clause<br/>at query time"]
+    T --> Q["selection query"]
+    L --> Q
+```
 
 **Why needed.** `active_tasks < 5` changes on every assignment. If it were part of stored
 eligibility, one assignment would invalidate every stored set containing that user. At the
@@ -193,10 +247,15 @@ ordering. Four keys retained.
 **Solution.** The task is created and left unassigned in a pool. It is never rejected. Three
 states are reported distinctly:
 
-```
-placement has not run yet          → "pending"
-placement ran, 0 users match rule  → structural: the rule matches nobody
-placement ran, all at capacity     → transient: resolves on the next completion
+```mermaid
+flowchart TB
+    T["task created"] --> P{"has placement<br/>run yet?"}
+    P -->|"placement_attempted_at IS NULL"| PEND["pending<br/>the worker has not reached it"]
+    P -->|"stamped"| A{"assignee set?"}
+    A -->|yes| OK["assigned"]
+    A -->|no| E{"eligible_count"}
+    E -->|"= 0"| ST["structural<br/>no user matches this rule<br/>→ the rule needs changing"]
+    E -->|"> 0"| TR["transient<br/>all matching users at capacity<br/>→ resolves on the next completion"]
 ```
 
 **Why needed.**
@@ -246,6 +305,16 @@ fill_capacity(user):
         claim it; stop when nothing fits
 ```
 
+```mermaid
+flowchart LR
+    E1["Task completed"] --> P
+    E2["Stable attributes changed"] --> P
+    E3["User created"] --> P
+    E4["Task created"] --> P
+    E5["Rule finished materialising"] --> P
+    P["fill_capacity(user)<br/>reads the pool in priority order"] --> A["assignee set"]
+```
+
 Five events call it:
 
 | Event | Why it can change the outcome |
@@ -259,13 +328,20 @@ Five events call it:
 **Why needed.** With two assignment paths — a direct assign on creation, plus a pool drain on
 completion — the priority guarantee fails:
 
-```
-A P0 waits; all eligible users are at capacity.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Completion
+    participant Q as Job queue
+    participant N as New P2 task
+    participant S as The freed slot
 
-t0  a user completes a task    → slot frees, drain job queued
-t1  a P2 task is created       → direct-assign job queued
-t2  the P2 job runs first      → takes the free slot
-t3  the drain job runs         → no capacity → P0 still waiting
+    Note over S: a P0 is already waiting —<br/>all eligible users are at capacity
+    C->>Q: slot freed, queue the pool drain
+    N->>Q: queue direct-assign for the new P2
+    Q->>S: direct-assign runs first and takes the slot
+    Q->>S: pool drain runs, finds no capacity
+    Note over S: P2 overtook P0
 ```
 
 The direct path does not consult the pool, so it cannot know a higher-priority task is already
@@ -294,16 +370,41 @@ Zero rows returned means another worker took the slot; the caller tries the next
 **Why needed.** Reading a value, deciding, then writing is three separate operations. Another
 process can act between them:
 
-```
-Worker A                      Worker B
-read count = 4
-                              read count = 4
-4 < 5 ✓ → assign
-                              4 < 5 ✓ → assign
-write count = 5
-                              write count = 5
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Worker A
+    participant D as Database
+    participant B as Worker B
 
-Result: user holds 6 tasks, counter says 5.
+    Note over A,B: read-decide-write, no protection
+    A->>D: read count
+    D-->>A: 4
+    B->>D: read count
+    D-->>B: 4
+    A->>A: 4 < 5, assign
+    B->>B: 4 < 5, assign
+    A->>D: write count = 5
+    B->>D: write count = 5
+    Note over D: user holds 6 tasks,<br/>counter says 5 — both wrong
+```
+
+With the check inside the write:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Worker A
+    participant D as Database
+    participant B as Worker B
+
+    A->>D: UPDATE ... WHERE count < 5
+    B->>D: UPDATE ... WHERE count < 5
+    D-->>A: 1 row, count now 5
+    Note over B,D: B blocks on the locked row,<br/>then re-reads the new value
+    D->>D: re-evaluate 5 < 5 = false
+    D-->>B: 0 rows
+    Note over B: B learns it lost,<br/>tries the next candidate
 ```
 
 PostgreSQL locks a row while updating it. The second worker blocks, then re-reads the updated
@@ -425,13 +526,32 @@ lock, so submitting the same request twice performs the work once.
 **Solution.** Redis holds a job queue; Celery workers consume it. The web server queues work
 and responds immediately.
 
-```
-HTTP request ──► save task ──► queue jobs ──► respond
-                                   │
-                                   ▼
-                            worker process
-                            ├─ materialize_rule
-                            └─ fill_capacity
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Manager
+    participant W as Web
+    participant D as PostgreSQL
+    participant Q as Redis queue
+    participant K as Worker
+
+    M->>W: POST /tasks/ with a rule
+    W->>W: canonicalise + hash the rule
+    W->>D: reuse the rule, or insert it
+    W->>D: insert task, assignee = NULL
+    W->>Q: queue materialize_rule
+    W->>Q: queue place_task
+    W-->>M: 201 "pending"
+    Note over M,W: the response returns before<br/>the assignment exists
+
+    Q->>K: materialize_rule
+    K->>D: INSERT the rule's eligible users
+    K->>K: drain this rule's pooled tasks
+    Q->>K: place_task
+    K->>D: pick the top candidate (four-key order)
+    K->>D: compare-and-set the capacity claim
+    K->>D: set assignee
+    Note over K,D: ~0.6 s after the response
 ```
 
 **Why needed.** Assignment scans a rule's eligible users and must survive competing claims.
@@ -550,6 +670,44 @@ cookies with CSRF protection would be used in production.
 ---
 
 ## 9. Data model
+
+```mermaid
+erDiagram
+    users ||--o{ rule_eligible_user : "appears in"
+    rules ||--o{ rule_eligible_user : "materialises to"
+    rules ||--o{ tasks : "governs"
+    users ||--o{ tasks : "authors"
+    users ||--o{ tasks : "is assigned"
+
+    users {
+        text department "stable, hashed"
+        int experience_years "stable, hashed"
+        text location "stable, hashed"
+        int active_task_count "volatile, capacity cap"
+        numeric committed_effort_hours "volatile, key 1"
+        numeric lifetime_hours "volatile, key 2"
+        timestamp date_joined "key 3"
+        bigint id "key 4"
+    }
+    rules {
+        text fingerprint "sha256, unique"
+        jsonb predicates "stable only"
+        int max_active_tasks "outside the hash"
+        int eligible_count "size of the set"
+    }
+    rule_eligible_user {
+        bigint rule_id FK
+        bigint user_id FK
+    }
+    tasks {
+        smallint priority "0 = highest"
+        numeric effort_hours "orders selection"
+        text status "todo in_progress done cancelled"
+        bigint rule_id FK
+        bigint assignee_id FK "null = pooled"
+        timestamp placement_attempted_at "has placement run"
+    }
+```
 
 ```
 users
