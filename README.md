@@ -1177,7 +1177,7 @@ assignment/
   tasks.py         37   Celery entry points
   views.py        588   validate, delegate, serialise
   urls.py          25
-  tests.py        815   56 tests
+  tests.py             68 tests
   management/commands/
     seed.py            demo data, drives the real service layer
     seed_scale.py      benchmark data, parameterised on rule count and selectivity
@@ -1250,6 +1250,19 @@ Rules arrive from an API, so `rules.py` treats its input as hostile:
 - Multi-valued predicates are **rejected rather than truncated** — silently dropping a department
   would route work to the wrong team with no error to observe
 - Generated SQL is always parameterised
+
+Three boundaries were found weak by adversarially probing the running system, and each is now
+pinned by a regression test:
+
+| Boundary | What was wrong | Now |
+|---|---|---|
+| **Signup** | `role` was a writable field on an unauthenticated endpoint, so anyone could register as an admin and call the admin-only endpoints | Read-only, forced to `user`. Role is an administrative action, not a registrant's choice |
+| **Effort edits** | Changing `effort_hours` on an assigned task wrote the field without moving the assignee's `committed_effort_hours`. Measured: a 0.50h task edited to 99.00h left the counter at 17.50 against a true sum of 116.00, skewing selection permanently | `update_task_fields` moves the difference in the same transaction |
+| **Reads** | Any authenticated user could enumerate eligible users for any task — colleagues' usernames and current workload — and read any task's detail | Eligibility is Manager/Admin only; task detail follows assignment, as the list already did |
+
+**Mass assignment is closed by construction**: `assignee`, `created_by`, `status` and
+`placement_attempted_at` are absent from the create serializer, so a request that sets them is
+ignored rather than honoured. Verified by probing.
 
 ## 8.6 One source of truth per rule
 
@@ -1375,7 +1388,7 @@ cross-origin, so Django needs no CORS package.
 | Screen | Visible to | What it does |
 |---|---|---|
 | **Create task** | Manager, Admin | Task fields, plus a rule builder that mirrors the closed predicate set exactly. A live panel shows the rule JSON as it will be sent. After submitting, it polls the task until the outcome settles — `placement queued…` then `assigned to userNNNN` |
-| **My tasks** | Every role | The caller's own work, in priority order, with description and due date. Complete or cancel from here |
+| **My tasks** | Every role | The caller's own work, in priority order, with description and due date. **Start** moves a task to `in_progress` and **Stop** returns it to `todo`; Complete and Cancel are the terminal transitions |
 
 **Why the tab list depends on the role.** Authoring is restricted to Managers and Admins. The
 access token carries a `role` claim, so a User is not shown a form the API would reject after
@@ -1441,7 +1454,7 @@ marked), or **resolved** (decided with the requester).
 | One assignee per task | The brief says "assigns the task to *the* eligible user". Multiple assignees change the counter semantics in §1.7 |
 | `active_task_count` counts every non-terminal task | Shifts when capacity frees |
 | `max_active_tasks` is per rule and optional | The brief's `< 5` is an example inside a rule, not a system setting |
-| `effort_hours` is an estimate set at creation, editable | It gates nothing, so an edit can never invalidate an existing assignment |
+| `effort_hours` is an estimate set at creation, editable | It gates nothing, so an edit can never invalidate an existing assignment. Editing it on an assigned task moves the difference into the assignee's `committed_effort_hours` in the same transaction — without that the counter desyncs permanently ([§8.5](#85-trust-boundaries)) |
 | Departments are distributed evenly | Only used to bound rule selectivity at ≤ 0.25 |
 | Storage is SSD | `random_page_cost = 1.1`; wrong on spinning or high-latency storage |
 | Single PostgreSQL instance | All sizing assumes one node — no sharding, no read replicas |
@@ -1575,7 +1588,7 @@ would need a realistic distribution.
 
 # Appendix D — Verification
 
-**56 tests**, PostgreSQL 14. They cover the paths where an error is not visible at runtime:
+**68 tests**, PostgreSQL 14. They cover the paths where an error is not visible at runtime:
 
 | Test area | What it prevents |
 |---|---|
@@ -1587,6 +1600,10 @@ would need a realistic distribution.
 | Counter release on delete | Capacity leaking when a task is removed |
 | Cache and lock failure modes | A lock wedging a rule permanently |
 | Status transitions | A field edit bypassing the counter bookkeeping |
+| Signup role escalation | An unauthenticated caller registering as an admin |
+| Effort edits moving committed hours | A counter desync that skews selection with no error |
+| Read authorisation | A recipient enumerating colleagues' workload, or reading the board |
+| The uncapped-rule drain | One transaction absorbing an entire pool when a rule sets no cap |
 
 ```bash
 python manage.py test assignment

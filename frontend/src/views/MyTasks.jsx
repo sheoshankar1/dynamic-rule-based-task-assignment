@@ -15,6 +15,14 @@ export default function MyTasks() {
     load();
   }
 
+  // Todo -> In Progress -> Done is the status flow the brief specifies. The
+  // middle state was reachable through the API but had no control here, so a
+  // task could only jump straight to done.
+  async function move(id, status) {
+    await api.setStatus(id, status);
+    load();
+  }
+
   if (error) return <div className="panel err">{error}</div>;
   if (!tasks) return <div className="panel">Loading...</div>;
 
@@ -49,7 +57,16 @@ export default function MyTasks() {
                 <td>{t.effort_hours}h</td>
                 <td style={{ color: "var(--muted)" }}>{t.due_date || "—"}</td>
                 <td>{t.status}</td>
-                <td style={{ textAlign: "right" }}>
+                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                  {t.status === "todo" ? (
+                    <button className="mini" onClick={() => move(t.id, "in_progress")}>
+                      Start
+                    </button>
+                  ) : (
+                    <button className="mini" onClick={() => move(t.id, "todo")}>
+                      Stop
+                    </button>
+                  )}{" "}
                   <button className="mini" onClick={() => finish(t.id, false)}>
                     Complete
                   </button>{" "}

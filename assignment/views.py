@@ -270,6 +270,11 @@ class EligibleUsersView(APIView):
     in ladder order."""
 
     def get(self, request, pk):
+        # Eligibility exposes colleagues' usernames and current workload, so it
+        # is an authoring view, not something every recipient may enumerate.
+        if request.user.role not in (User.Role.MANAGER, User.Role.ADMIN):
+            return Response({"detail": "only Managers and Admins may inspect eligibility"},
+                            status=status.HTTP_403_FORBIDDEN)
         task = get_object_or_404(Task.objects.select_related("rule"), pk=pk)
         cap = task.rule.max_active_tasks
         qs = (
@@ -397,9 +402,7 @@ class TaskUpdateView(APIView):
             changed = edit.validated_data
             new_status = changed.pop("status", None)
             if changed:
-                for field, value in changed.items():
-                    setattr(task, field, value)
-                task.save(update_fields=list(changed))
+                services.update_task_fields(pk, changed)
             if new_status:
                 try:
                     services.set_status(pk, new_status)
@@ -493,6 +496,11 @@ class RecomputeEligibilityView(APIView):
 
 class SignupSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
+    # Read-only, and forced to USER on create. Signup is an unauthenticated
+    # endpoint: accepting a role from the request body let anyone register as
+    # an admin and then call the admin-only endpoints. Role changes are an
+    # administrative action, not something the registrant chooses.
+    role = serializers.CharField(read_only=True)
 
     class Meta:
         model = User
@@ -500,8 +508,9 @@ class SignupSerializer(serializers.ModelSerializer):
                   "experience_years", "location")
 
     def create(self, validated):
+        validated.pop("role", None)          # belt and braces if fields change
         # create_user hashes; User.objects.create would store it in clear.
-        return User.objects.create_user(**validated)
+        return User.objects.create_user(role=User.Role.USER, **validated)
 
 
 @extend_schema(
@@ -565,6 +574,12 @@ class TaskDetailView(TaskUpdateView):
     def get(self, request, pk):
         task = get_object_or_404(
             Task.objects.select_related("rule", "assignee", "created_by"), pk=pk)
+        # Visibility follows assignment, exactly as it does for the list and for
+        # /my-eligible-tasks. A recipient has no business reading the board.
+        if (request.user.role == User.Role.USER
+                and task.assignee_id != request.user.id):
+            return Response({"detail": "not your task"},
+                            status=status.HTTP_403_FORBIDDEN)
         return Response({
             "id": task.id,
             "title": task.title,

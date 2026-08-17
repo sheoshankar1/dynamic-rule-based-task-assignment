@@ -14,6 +14,7 @@ from decimal import Decimal
 from unittest import mock
 
 from django.core.cache import cache
+from django.db.models import Sum
 from django.test import TestCase
 from rest_framework.test import APIClient
 from django.utils import timezone
@@ -846,3 +847,149 @@ class TokenClaimsTests(TestCase):
             "rules": {"department": "Finance"},
         }, format="json")
         self.assertEqual(res.status_code, 403)
+
+
+class RedTeamRegressionTests(TestCase):
+    """Defects found by adversarially probing the running system.
+
+    Each of these passed every existing test while being exploitable or wrong,
+    which is why they are pinned here explicitly.
+    """
+
+    def setUp(self):
+        self.manager = make_user("mgr", role=User.Role.MANAGER, dept="Operations")
+        self.rule, _ = services.get_or_create_rule(
+            {"department": "Finance", "max_active_tasks": 5})
+        self.worker = make_user("worker", dept="Finance")
+        services.materialize_rule(self.rule.id)
+        self.task = Task.objects.create(
+            title="t", priority=1, effort_hours=Decimal("2.0"),
+            rule=self.rule, created_by=self.manager)
+        services.place_task(self.task.id)
+        self.task.refresh_from_db()
+
+    def _client(self, user=None):
+        c = APIClient()
+        if user:
+            c.force_authenticate(user=user)
+        return c
+
+    # -- H1: privilege escalation ------------------------------------------
+    def test_signup_cannot_choose_its_own_role(self):
+        """Signup is unauthenticated. Accepting `role` from the body let anyone
+        register as an admin and then call the admin-only endpoints."""
+        res = self._client().post("/auth/signup", {
+            "username": "escalate", "password": "password123",
+            "role": "admin", "department": "IT", "experience_years": 1,
+        }, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["role"], User.Role.USER)
+        self.assertEqual(User.objects.get(username="escalate").role, User.Role.USER)
+
+    def test_a_self_registered_account_cannot_reach_admin_endpoints(self):
+        self._client().post("/auth/signup", {
+            "username": "escalate2", "password": "password123", "role": "admin",
+        }, format="json")
+        client = self._client(User.objects.get(username="escalate2"))
+        self.assertEqual(
+            client.post("/tasks/recompute-eligibility", {}, format="json").status_code,
+            403)
+        self.assertEqual(
+            client.post("/tasks/", {"title": "x", "priority": 2,
+                                    "effort_hours": "1.0",
+                                    "rules": {"department": "IT"}},
+                        format="json").status_code,
+            403)
+
+    # -- H2: counter desync on an effort edit ------------------------------
+    def test_editing_effort_moves_the_assignees_committed_hours(self):
+        self.worker.refresh_from_db()
+        self.assertEqual(self.worker.committed_effort_hours, Decimal("2.00"))
+
+        res = self._client(self.manager).patch(
+            f"/tasks/{self.task.id}", {"effort_hours": "9.00"}, format="json")
+        self.assertEqual(res.status_code, 200)
+
+        self.worker.refresh_from_db()
+        self.assertEqual(self.worker.committed_effort_hours, Decimal("9.00"))
+
+    def test_committed_hours_match_the_task_table_after_an_edit(self):
+        self._client(self.manager).patch(
+            f"/tasks/{self.task.id}", {"effort_hours": "7.50"}, format="json")
+        self.worker.refresh_from_db()
+        true_sum = (Task.objects.filter(assignee=self.worker)
+                    .exclude(status__in=Task.TERMINAL)
+                    .aggregate(s=Sum("effort_hours"))["s"])
+        self.assertEqual(self.worker.committed_effort_hours, true_sum)
+
+    def test_editing_effort_on_an_unassigned_task_touches_no_counter(self):
+        pooled = Task.objects.create(
+            title="pooled", priority=2, effort_hours=Decimal("1.0"),
+            rule=self.rule, created_by=self.manager)
+        before = User.objects.get(pk=self.worker.pk).committed_effort_hours
+        self._client(self.manager).patch(
+            f"/tasks/{pooled.id}", {"effort_hours": "40.0"}, format="json")
+        self.assertEqual(
+            User.objects.get(pk=self.worker.pk).committed_effort_hours, before)
+
+    # -- H5: information disclosure ----------------------------------------
+    def test_a_user_cannot_enumerate_eligibility(self):
+        """Eligibility exposes colleagues' usernames and current workload."""
+        res = self._client(self.worker).get(
+            f"/tasks/{self.task.id}/eligible-users")
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(
+            self._client(self.manager).get(
+                f"/tasks/{self.task.id}/eligible-users").status_code, 200)
+
+    def test_a_user_cannot_read_someone_elses_task(self):
+        other = make_user("other", dept="Finance")
+        res = self._client(other).get(f"/tasks/{self.task.id}")
+        self.assertEqual(res.status_code, 403)
+        # their own task is still readable
+        self.assertEqual(
+            self._client(self.worker).get(f"/tasks/{self.task.id}").status_code,
+            200)
+
+    # -- H4: the middle status was unreachable from the product ------------
+    def test_the_assignee_can_move_a_task_through_in_progress(self):
+        client = self._client(self.worker)
+        self.assertEqual(
+            client.patch(f"/tasks/{self.task.id}",
+                         {"status": "in_progress"}, format="json").status_code, 200)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.status, Task.Status.IN_PROGRESS)
+
+
+class UncappedRuleTests(TestCase):
+    """A rule may omit `max_active_tasks`. The claim then never fails, so the
+    drain loop needs its own bound or one transaction could absorb an entire
+    pool."""
+
+    def setUp(self):
+        self.manager = make_user("mgr", role=User.Role.MANAGER, dept="Operations")
+        self.rule, _ = services.get_or_create_rule({"department": "Finance"})
+        self.worker = make_user("worker", dept="Finance")
+        services.materialize_rule(self.rule.id)
+
+    def test_an_uncapped_rule_still_assigns(self):
+        self.assertIsNone(self.rule.max_active_tasks)
+        task = Task.objects.create(
+            title="t", priority=1, effort_hours=Decimal("1.0"),
+            rule=self.rule, created_by=self.manager)
+        self.assertEqual(services.place_task(task.id), self.worker.id)
+
+    def test_the_drain_is_bounded_even_with_no_cap(self):
+        Task.objects.bulk_create([
+            Task(title=f"t{i}", priority=2, effort_hours=Decimal("1.0"),
+                 rule=self.rule, created_by=self.manager)
+            for i in range(services.FILL_BATCH + 25)
+        ])
+        with self.assertLogs("assignment.services", level="WARNING"):
+            assigned = services.fill_capacity(self.worker.id)
+        self.assertEqual(len(assigned), services.FILL_BATCH)
+
+        # the remainder is still pooled, and the sweep is what collects it
+        self.assertEqual(
+            Task.objects.filter(rule=self.rule, assignee__isnull=True)
+            .exclude(status__in=Task.TERMINAL).count(), 25)

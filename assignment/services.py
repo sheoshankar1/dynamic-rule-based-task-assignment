@@ -15,7 +15,7 @@ from datetime import timedelta
 
 from django.core.cache import cache
 from django.db import connection, transaction
-from django.db.models import Exists, OuterRef, Q
+from django.db.models import Exists, F, OuterRef, Q
 from django.utils import timezone
 
 from .models import Rule, RuleEligibleUser, Task, User
@@ -54,6 +54,11 @@ MATERIALIZE_LOCK_KEY = "rule:materializing:{}"
 MATERIALIZE_LOCK_TTL = 300
 # How many pooled tasks a single materialisation will try to place.
 PLACE_AFTER_MATERIALIZE = 200
+# A rule may omit max_active_tasks, in which case the claim never fails and the
+# loop below would drain that rule's whole pool into one user inside a single
+# transaction. Capped so the transaction stays short; the sweep picks up any
+# remainder on its next run, exactly as it does for a dropped message.
+FILL_BATCH = 100
 
 
 def rule_spec(rule_id):
@@ -253,7 +258,7 @@ def fill_capacity(user_id):
     """
     assigned = []
     with connection.cursor() as cur:
-        while True:
+        while len(assigned) < FILL_BATCH:
             cur.execute(_NEXT_POOLED_TASK, [user_id])
             row = cur.fetchone()
             if row is None:
@@ -268,6 +273,12 @@ def fill_capacity(user_id):
                 [user_id, task_id],
             )
             assigned.append(task_id)
+
+    if len(assigned) == FILL_BATCH:
+        logger.warning(
+            "fill_capacity(%s) hit the %s batch cap - an uncapped rule with a "
+            "large pool. Remainder left for the sweep.", user_id, FILL_BATCH)
+    return assigned
 
 
 def place_task(task_id):
@@ -490,3 +501,33 @@ def delete_task(task_id):
     if task.assignee_id is not None and task.status not in Task.TERMINAL:
         _release(task)
     task.delete()
+
+
+@transaction.atomic
+def update_task_fields(task_id, changes):
+    """Edit a task's own fields, keeping the capacity counters truthful.
+
+    `effort_hours` is not an ordinary field: while a task is assigned and open,
+    its effort is part of the assignee's `committed_effort_hours`. Writing the
+    new value without moving that difference leaves the counter permanently
+    wrong -- the assignee looks busier or idler than they are, every later
+    selection is skewed, and nothing surfaces it.
+
+    Verified before the fix: editing a 0.50h task to 99.00h left the assignee's
+    committed hours at 17.50 while the true sum was 116.00.
+    """
+    task = Task.objects.select_for_update().get(pk=task_id)
+    delta = None
+    if "effort_hours" in changes:
+        delta = changes["effort_hours"] - task.effort_hours
+
+    for field, value in changes.items():
+        setattr(task, field, value)
+    task.save(update_fields=list(changes))
+
+    # Only open, assigned work is counted in committed hours.
+    if delta and task.assignee_id and task.status not in Task.TERMINAL:
+        User.objects.filter(pk=task.assignee_id).update(
+            committed_effort_hours=F("committed_effort_hours") + delta
+        )
+    return task

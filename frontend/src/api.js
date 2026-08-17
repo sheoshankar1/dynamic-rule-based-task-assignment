@@ -100,6 +100,8 @@ export const api = {
   updateRules: (id, rules) =>
     request(`/tasks/${id}`, { method: "PATCH", body: { rules } }),
   myTasks: () => request("/my-eligible-tasks"),
+  setStatus: (id, status) =>
+    request(`/tasks/${id}`, { method: "PATCH", body: { status } }),
   complete: (id, cancelled) =>
     request(`/tasks/${id}/complete${cancelled ? "?cancelled=1" : ""}`, {
       method: "POST",
