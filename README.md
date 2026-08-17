@@ -13,6 +13,7 @@ background, in priority order.
 > the security simplifications (notably JWTs in `localStorage`) with what production would
 > use instead.
 
+**System explainer (requirement → solution → why):** [EXPLAINER.md](EXPLAINER.md)
 **Requirement-by-requirement traceability:** [REQUIREMENTS.md](REQUIREMENTS.md)
 **Delivery plan, backlog and board:** [ROADMAP.md](ROADMAP.md)
 **Evidence:** §12 lists exactly what has been measured and what has not.
