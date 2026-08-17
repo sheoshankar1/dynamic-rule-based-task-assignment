@@ -32,6 +32,7 @@ seeds automatically before serving.
 | UI | http://localhost:5173 |
 | API documentation (Swagger) | http://localhost:8000/docs |
 | OpenAPI schema | http://localhost:8000/schema |
+| Django admin (browse the schema) | http://localhost:8000/admin |
 
 Logins after seeding: `manager` / `manager`, `admin` / `admin`, or any `userNNNN` / `demo`.
 
@@ -124,6 +125,26 @@ The seed takes about 5 minutes and replaces the demo data. The benchmark prints 
 
 ---
 
+## Contents
+
+| | |
+|---|---|
+| [Running it](#running-it) | Prerequisites, start-up, verification, troubleshooting |
+| [Deliverables](#deliverables) · [Evaluation criteria](#evaluation-criteria) | Index tables into the sections below |
+| [Part 1](#part-1--architecture-decisions) | Architecture decisions — the ten that shape the system |
+| [Part 2](#part-2--rule-engine-design) | Rule engine design |
+| [Part 3](#part-3--recompute-strategy) | Recompute strategy |
+| [Part 4](#part-4--database-design-and-indexing) | Database design and indexing |
+| [Part 5](#part-5--caching-strategy) | Caching strategy |
+| [Part 6](#part-6--performance-optimisation) | Performance optimisation |
+| [Part 7](#part-7--background-processing-design) | Background processing design |
+| [Part 8](#part-8--code-structure) | Code structure |
+| [Part 9](#part-9--apis-and-remaining-deliverables) | APIs, seeds, Docker, auth, admin, frontend |
+| [Appendix A](#appendix-a--assumptions-and-open-questions) | Assumptions and open questions |
+| [Appendix B](#appendix-b--requirement-traceability) | Requirement traceability |
+| [Appendix C](#appendix-c--evidence-measured-versus-reasoned) | Measured versus reasoned |
+| [Appendix D](#appendix-d--verification) | Verification and the consistency model |
+
 ## Deliverables
 
 | # | Deliverable | Status | Where |
@@ -162,6 +183,20 @@ first appear.
 ---
 
 # Part 1 — Architecture decisions
+
+## 1.0 Stack
+
+The brief suggests a stack rather than mandating one. Each choice, and what it is doing here:
+
+| Suggested | Used | Why this one |
+|---|---|---|
+| Python — Django or FastAPI | **Django 4.2 + DRF** | The work is model-heavy: migrations, a custom user model, an admin, an ORM for the majority of queries that are ordinary. FastAPI would mean assembling those separately, for no gain on the part that is actually hard — the SQL in [§8.4](#84-where-raw-sql-is-used-and-why), which neither framework writes for you |
+| PostgreSQL | **PostgreSQL 14** | Partial indexes, `UPDATE ... RETURNING`, and mixed ASC/DESC composite indexes are each load-bearing ([§1.7](#17-decision-capacity-is-claimed-with-a-compare-and-set), [§4.2](#42-indexing-strategy)). The design does not port unchanged to MySQL |
+| Redis — caching and queues | **Both** | Celery broker, the immutable rule cache, the single-flight lock, and the recompute debounce ([Part 5](#part-5--caching-strategy)) |
+| Celery / RQ / worker | **Celery, beat in the worker process** | The two periodic jobs run every five minutes and hourly; a separate scheduler container would add a process to deploy and monitor for milliseconds of work per hour ([§7.6](#76-worker-topology)) |
+| JWT + refresh tokens | **SimpleJWT** | The client refreshes once transparently on a 401, then stops rather than looping |
+| React | **React 18 + Vite** | Two screens, deliberately ([§9 Frontend](#frontend)) |
+| Docker & Docker Compose | **Five services** | Verified running end to end, not only written ([§9 Docker setup](#docker-setup)) |
 
 ## 1.1 The problem
 
@@ -1331,6 +1366,42 @@ docker compose up --build
 
 Verified running end to end: all services reach healthy, the seed runs in-container, the API,
 Swagger and UI all respond, and the worker processes placement through Redis.
+
+## Frontend
+
+Two screens, served by Vite at http://localhost:5173. It proxies the API rather than calling it
+cross-origin, so Django needs no CORS package.
+
+| Screen | What it does |
+|---|---|
+| **Create task** | Task fields, plus a rule builder that mirrors the closed predicate set exactly. A live panel shows the rule JSON as it will be sent. After submitting, it polls the task until the outcome settles — `placement queued…` then `assigned to userNNNN` |
+| **My tasks** | The caller's own work, in priority order, with description and due date. Complete or cancel from here |
+
+**Why the rule builder is a fixed form rather than a JSON field.** There is no rule language
+([§2.1](#21-rule-shape)), so the shape of the form *is* the shape of a rule. A free-text field
+would imply expressiveness the engine does not have.
+
+**Why it polls.** Assignment happens in a worker, so the create response cannot know the outcome
+([§7.1](#71-why-any-of-this-is-background-work)). The UI polls `GET /tasks/{id}` until the task
+is assigned or the outcome stops being pending, and says so plainly if it never settles —
+*"still unassigned after 6s — is the Celery worker running?"* — rather than inventing a reason.
+
+**Deliberately thin.** The UI appears in none of the evaluation criteria. It exists to
+demonstrate the assignment engine, not as a design exercise.
+
+## Django admin
+
+http://localhost:8000/admin — sign in as `admin` / `admin`.
+
+Useful for inspecting the schema without a `psql` session: rules with their fingerprint,
+eligible-user count and how many tasks reference them; the materialised eligibility table; tasks
+with their assignee and placement state.
+
+**Read-oriented on purpose.** The volatile counters, the eligibility table and `assignee` are all
+shown but not editable. They are derived or transactionally maintained state — editing them by
+hand would desynchronise them from the tasks table with nothing to surface the drift. The admin
+also offers no way to assign a task manually, because that is the premise the system is built
+against.
 
 ## Authentication and authorization
 
