@@ -8,6 +8,22 @@ const REFRESH = "refresh_token";
 export const getToken = () => localStorage.getItem(ACCESS);
 export const isAuthed = () => Boolean(getToken());
 
+// Read the role from the access token so the UI can hide actions the caller
+// cannot perform. Presentation only -- the server enforces every rule anyway,
+// so a forged claim buys a visible button and a 403.
+export function currentUser() {
+  const token = getToken();
+  if (!token) return null;
+  try {
+    const [, payload] = token.split(".");
+    const json = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+    const { role, username } = JSON.parse(json);
+    return { role, username };
+  } catch {
+    return null;   // malformed token: treat as the least-privileged case
+  }
+}
+
 export function clearTokens() {
   localStorage.removeItem(ACCESS);
   localStorage.removeItem(REFRESH);

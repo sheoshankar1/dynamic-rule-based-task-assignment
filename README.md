@@ -1372,10 +1372,15 @@ Swagger and UI all respond, and the worker processes placement through Redis.
 Two screens, served by Vite at http://localhost:5173. It proxies the API rather than calling it
 cross-origin, so Django needs no CORS package.
 
-| Screen | What it does |
-|---|---|
-| **Create task** | Task fields, plus a rule builder that mirrors the closed predicate set exactly. A live panel shows the rule JSON as it will be sent. After submitting, it polls the task until the outcome settles — `placement queued…` then `assigned to userNNNN` |
-| **My tasks** | The caller's own work, in priority order, with description and due date. Complete or cancel from here |
+| Screen | Visible to | What it does |
+|---|---|---|
+| **Create task** | Manager, Admin | Task fields, plus a rule builder that mirrors the closed predicate set exactly. A live panel shows the rule JSON as it will be sent. After submitting, it polls the task until the outcome settles — `placement queued…` then `assigned to userNNNN` |
+| **My tasks** | Every role | The caller's own work, in priority order, with description and due date. Complete or cancel from here |
+
+**Why the tab list depends on the role.** Authoring is restricted to Managers and Admins. The
+access token carries a `role` claim, so a User is not shown a form the API would reject after
+they had filled it in. This is presentation only — every endpoint still checks the role
+server-side, so a forged claim buys a visible button and a 403.
 
 **Why the rule builder is a fixed form rather than a JSON field.** There is no rule language
 ([§2.1](#21-rule-shape)), so the shape of the form *is* the shape of a rule. A free-text field

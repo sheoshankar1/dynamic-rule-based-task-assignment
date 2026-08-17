@@ -24,7 +24,9 @@ export default function Login({ onDone }) {
   return (
     <div className="wrap" style={{ maxWidth: 380, paddingTop: 80 }}>
       <h1>Sign in</h1>
-      <p className="sub">Seeded logins: manager/manager, admin/admin</p>
+      <p className="sub">
+        Seeded logins: manager/manager, admin/admin, or any userNNNN/demo
+      </p>
       <form className="panel" onSubmit={submit}>
         <label>Username</label>
         <input value={username} onChange={(e) => setUsername(e.target.value)} />

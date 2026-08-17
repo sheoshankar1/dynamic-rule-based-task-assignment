@@ -813,3 +813,36 @@ class TransitionErrorMessageTests(TestCase):
         message = str(res.json()["status"])
         self.assertIn("complete", message)
         self.assertIn("counters", message)
+
+
+class TokenClaimsTests(TestCase):
+    """The access token carries the role so the UI can hide what it cannot use.
+
+    Presentation only: every endpoint still checks the role server-side, which
+    the authorisation tests cover. This asserts the claim is present and
+    correct, because a missing claim would silently show a User a form the API
+    rejects after they filled it in.
+    """
+
+    def test_access_token_carries_role_and_username(self):
+        import json, base64
+        make_user("mgr2", role=User.Role.MANAGER, dept="Operations")
+        res = APIClient().post("/auth/login",
+                               {"username": "mgr2", "password": "x"},
+                               format="json")
+        self.assertEqual(res.status_code, 200)
+        payload = res.json()["access"].split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        self.assertEqual(claims["role"], User.Role.MANAGER)
+        self.assertEqual(claims["username"], "mgr2")
+
+    def test_a_plain_user_still_cannot_author_regardless_of_the_claim(self):
+        worker = make_user("plain", dept="Finance")
+        client = APIClient()
+        client.force_authenticate(user=worker)
+        res = client.post("/tasks/", {
+            "title": "nope", "priority": 2, "effort_hours": "1.0",
+            "rules": {"department": "Finance"},
+        }, format="json")
+        self.assertEqual(res.status_code, 403)

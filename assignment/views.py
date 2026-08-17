@@ -18,6 +18,8 @@ from drf_spectacular.utils import (
 )
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from . import services, tasks
 from .models import Rule, RuleEligibleUser, Task, User
@@ -586,3 +588,24 @@ class TaskDetailView(TaskUpdateView):
         get_object_or_404(Task, pk=pk)
         services.delete_task(pk)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class RoleTokenSerializer(TokenObtainPairSerializer):
+    """Adds `role` and `username` to the access token.
+
+    The UI uses this to hide actions the caller cannot perform. It is not
+    authorisation -- every endpoint still checks the role server-side. A client
+    that forged the claim would simply see a button and then a 403.
+    """
+
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token["role"] = user.role
+        token["username"] = user.username
+        return token
+
+
+@extend_schema(summary="Obtain a JWT pair; the access token carries role")
+class RoleTokenObtainPairView(TokenObtainPairView):
+    serializer_class = RoleTokenSerializer
